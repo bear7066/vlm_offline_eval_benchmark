@@ -51,9 +51,24 @@ class RealtimeResult:
             Use ``window_rtf`` to decide.
         video_duration_sec: Source clip duration.
         tokens: Number of generated tokens.
-        mean_power_watts: Mean GPU power over the inference.
-        peak_power_watts: Peak GPU power over the inference.
-        peak_vram_gb: Peak VRAM allocated during the inference.
+        energy_j: Energy drawn over the inference, integrated from timestamped
+            power samples. The figure that matters for an edge deployment,
+            since a fast-but-thirsty config and a slow-but-frugal one can draw
+            the same average watts.
+        power_sampled_sec: Span the power samples cover, which is slightly
+            shorter than the inference. Recorded so energy can be aggregated
+            as total-energy-over-total-time.
+        mean_power_watts: Time-weighted mean board power, ``energy_j`` over the
+            sampled span. Whole-board, so only meaningful on an idle GPU.
+        peak_power_watts: Highest power reading over the inference.
+        n_power_samples: Power readings collected. Treat 0 or 1 as
+            untrustworthy: a short inference may not span a full interval.
+        peak_vram_reserved_gb: Peak VRAM reserved by the PyTorch allocator,
+            summed over devices. Includes fragmentation; excludes the CUDA
+            context and non-PyTorch allocations.
+        peak_vram_device_gb: Highest device-wide VRAM use observed, from
+            ``mem_get_info``. Includes the CUDA context and any other process
+            on the card -- size deployment hardware against this.
         response: Model output text.
         label_word_overlap: Whether the response contained a label content word.
             A verbosity-confounded proxy, not correctness -- see
@@ -84,9 +99,13 @@ class RealtimeResult:
     rtf: float | None = None
     video_duration_sec: float | None = None
     tokens: int | None = None
+    energy_j: float | None = None
+    power_sampled_sec: float | None = None
     mean_power_watts: float | None = None
     peak_power_watts: float | None = None
-    peak_vram_gb: float | None = None
+    n_power_samples: int | None = None
+    peak_vram_reserved_gb: float | None = None
+    peak_vram_device_gb: float | None = None
     response: str = ""
     label_word_overlap: bool | None = None
     status: str = "success"
@@ -328,7 +347,9 @@ class ConfigSummary:
     mean_tpot_ms: float | None
     mean_decode_tps: float | None
     mean_tokens: float | None
-    mean_peak_vram_gb: float | None
+    mean_peak_vram_reserved_gb: float | None
+    max_peak_vram_device_gb: float | None
+    mean_energy_j: float | None
     mean_power_watts: float | None
     n_videos_scored: int
     naive_word_overlap: float | None
@@ -353,6 +374,32 @@ def _single_float(values: list[float]) -> float | None:
     """The one distinct value, or ``None`` if the runs disagree."""
     unique = set(values)
     return unique.pop() if len(unique) == 1 else None
+
+
+def _total_ratio(items: list[RealtimeResult], numerator: str, denominator: str) -> float | None:
+    """Sum of ``numerator`` over sum of ``denominator``, across runs.
+
+    For power this gives total energy over total sampled time, which is the
+    correctly time-weighted mean. A plain mean of per-run means would weight a
+    short run the same as a long one.
+
+    Args:
+        items: Successful runs for one config.
+        numerator: Field name to sum on top.
+        denominator: Field name to sum underneath.
+
+    Returns:
+        The ratio, or ``None`` if no run has both fields or the total is zero.
+    """
+    pairs = [
+        (getattr(r, numerator), getattr(r, denominator))
+        for r in items
+        if getattr(r, numerator) is not None and getattr(r, denominator) is not None
+    ]
+    if not pairs:
+        return None
+    bottom = sum(d for _n, d in pairs)
+    return sum(n for n, _d in pairs) / bottom if bottom > 0 else None
 
 
 def aggregate(
@@ -435,8 +482,12 @@ def aggregate(
                 mean_tpot_ms=_mean(column(items, "tpot_ms")),
                 mean_decode_tps=_mean(column(items, "decode_tps")),
                 mean_tokens=_mean(column(items, "tokens")),
-                mean_peak_vram_gb=_mean(column(items, "peak_vram_gb")),
-                mean_power_watts=_mean(column(items, "mean_power_watts")),
+                mean_peak_vram_reserved_gb=_mean(column(items, "peak_vram_reserved_gb")),
+                max_peak_vram_device_gb=max(
+                    column(items, "peak_vram_device_gb"), default=None
+                ),
+                mean_energy_j=_mean(column(items, "energy_j")),
+                mean_power_watts=_total_ratio(items, "energy_j", "power_sampled_sec"),
                 n_videos_scored=len(scored),
                 naive_word_overlap=(sum(scored) / len(scored)) if scored else None,
                 meets_realtime_p95=meets_realtime,

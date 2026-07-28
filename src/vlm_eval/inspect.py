@@ -15,7 +15,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from vlm_eval.config import JudgeConfig
-from vlm_eval.hardware import get_hardware_name, get_peak_vram_gb, reset_peak_memory_stats
+from vlm_eval.hardware import (
+    get_hardware_name,
+    get_peak_vram_reserved_gb,
+    reset_peak_memory_stats,
+)
 from vlm_eval.inference.gemma import HuggingFaceVLM
 from vlm_eval.judge.runner import run_judge
 from vlm_eval.logging_utils import configure_logging, quiet_third_party_loggers
@@ -156,7 +160,7 @@ def run_inference(
 
     _append_jsonl(predictions_path, result.to_dict())
 
-    logging.info("Peak VRAM: %s GB", get_peak_vram_gb())
+    logging.info("Peak VRAM: %s GB", get_peak_vram_reserved_gb())
     logging.info("Predictions written to: %s", predictions_path)
 
     return run_dir

@@ -56,7 +56,8 @@ def format_table(summaries: list[ConfigSummary]) -> str:
     header = (
         f"{'model':<18}{'frames':>7}{'tok':>5}{'p50_e2e':>9}{'p95_e2e':>9}"
         f"{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}{'p95_wrtf':>10}{'p95_rtf':>9}"
-        f"{'fps':>7}{'toks':>7}{'ovlp':>7}{'n':>4}{'ok':>7}{'RT?':>5}"
+        f"{'fps':>7}{'toks':>7}{'J':>8}{'W':>7}{'vramGB':>8}"
+        f"{'ovlp':>7}{'n':>4}{'ok':>7}{'RT?':>5}"
     )
     lines = [header, "-" * len(header)]
     for s in sorted(summaries, key=lambda x: (x.model_id, x.num_frames, x.max_new_tokens)):
@@ -73,6 +74,9 @@ def format_table(summaries: list[ConfigSummary]) -> str:
             f"{_fmt(s.p95_rtf):>9}"
             f"{_fmt(s.mean_max_sustainable_fps, '.1f'):>7}"
             f"{_fmt(s.mean_tokens, '.0f'):>7}"
+            f"{_fmt(s.mean_energy_j, '.1f'):>8}"
+            f"{_fmt(s.mean_power_watts, '.0f'):>7}"
+            f"{_fmt(s.max_peak_vram_device_gb, '.2f'):>8}"
             f"{_fmt(s.naive_word_overlap):>7}"
             f"{s.n_videos_scored:>4}"
             f"{f'{s.n_success}/{s.n_attempted}':>7}"
@@ -179,7 +183,10 @@ def analyze(run_dir: Path, threshold: float = 0.8, min_success_rate: float = 1.0
     legend = (
         "\nwrtf = window_rtf (latency / deployment stride; the real-time test).  "
         "rtf = latency / clip duration,\nreference only -- it scales as "
-        "1/duration, so it reflects clip lengths as much as the model."
+        "1/duration, so it reflects clip lengths as much as the model.\n"
+        "J = energy per inference, W = time-weighted board power, vramGB = peak "
+        "device-wide VRAM\n(includes CUDA context). Power is whole-board: only "
+        "meaningful on an otherwise idle GPU."
     )
     return (
         f"{table}\n\nFrame scaling (marginal cost per added frame):\n{scaling}\n"

@@ -10,7 +10,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from vlm_eval.config import BenchmarkConfig
-from vlm_eval.hardware import get_hardware_name, get_peak_vram_gb, reset_peak_memory_stats
+from vlm_eval.hardware import (
+    get_hardware_name,
+    get_peak_vram_reserved_gb,
+    reset_peak_memory_stats,
+)
 from vlm_eval.inference.gemma import HuggingFaceVLM
 from vlm_eval.logging_utils import configure_logging, quiet_third_party_loggers
 from vlm_eval.metrics import VideoResult, summarize_results
@@ -231,7 +235,7 @@ def run_benchmark(config: BenchmarkConfig) -> Path | None:
         model_id=config.model_id,
         dataset=dataset_name,
         num_frames=config.num_frames,
-        peak_vram_gb=get_peak_vram_gb(),
+        peak_vram_gb=get_peak_vram_reserved_gb(),
     )
     _write_json(run_dir / "summary.json", summary)
 

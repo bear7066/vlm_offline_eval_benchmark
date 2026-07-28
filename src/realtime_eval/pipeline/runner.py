@@ -4,12 +4,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from vlm_eval.hardware import get_peak_vram_gb, reset_peak_memory_stats
+from vlm_eval.hardware import get_peak_vram_reserved_gb, reset_peak_memory_stats
 from vlm_eval.inference.gemma import HuggingFaceVLM
 from vlm_eval.video import sample_frames
 
 from realtime_eval.core.metrics import RealtimeResult, label_word_overlap
-from realtime_eval.core.power import PowerSampler
+from realtime_eval.core.power import DeviceSampler
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +60,8 @@ def _timed_inference(
     prompt: str,
     max_new_tokens: int,
     power_interval_sec: float,
-) -> tuple[dict[str, Any], float | None, float | None, float | None]:
-    """Run one inference, measuring power and peak VRAM around it.
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run one inference, measuring power and VRAM around it.
 
     Args:
         model: Loaded VLM.
@@ -71,17 +71,27 @@ def _timed_inference(
         power_interval_sec: Background power sampling period.
 
     Returns:
-        A 4-tuple ``(generated, mean_watts, peak_watts, peak_vram_gb)`` where
-        ``generated`` is the raw dict from ``generate_from_frames``.
+        ``(generated, device)`` where ``generated`` is the raw dict from
+        ``generate_from_frames`` and ``device`` holds the power, energy and VRAM
+        readings for this run.
     """
     reset_peak_memory_stats()
-    with PowerSampler(interval_sec=power_interval_sec) as sampler:
+    with DeviceSampler(interval_sec=power_interval_sec) as sampler:
         generated = model.generate_from_frames(
             frames=frames,
             prompt_text=prompt,
             max_new_tokens=max_new_tokens,
         )
-    return generated, sampler.mean_watts, sampler.peak_watts, get_peak_vram_gb()
+    device = {
+        "mean_power_watts": sampler.mean_watts,
+        "peak_power_watts": sampler.peak_watts,
+        "energy_j": sampler.energy_j,
+        "power_sampled_sec": sampler.sampled_sec,
+        "n_power_samples": sampler.n_power_samples,
+        "peak_vram_reserved_gb": get_peak_vram_reserved_gb(),
+        "peak_vram_device_gb": sampler.peak_device_vram_gb,
+    }
+    return generated, device
 
 
 def run_config(
@@ -137,7 +147,7 @@ def run_config(
         label = label_by_path.get(path, "unknown")
         for repeat_index in range(repeats):
             try:
-                generated, mean_w, peak_w, peak_vram = _timed_inference(
+                generated, device = _timed_inference(
                     model, frames, prompt, max_new_tokens, power_interval_sec
                 )
             except Exception as exc:
@@ -194,11 +204,9 @@ def run_config(
                     rtf=rtf,
                     video_duration_sec=duration_sec,
                     tokens=generated["tokens"],
-                    mean_power_watts=mean_w,
-                    peak_power_watts=peak_w,
-                    peak_vram_gb=peak_vram,
                     response=response,
                     label_word_overlap=label_word_overlap(response, label),
+                    **device,
                 )
             )
     return results

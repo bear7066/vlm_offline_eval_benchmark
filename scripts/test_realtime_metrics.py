@@ -22,7 +22,9 @@ from realtime_eval.core.metrics import (
     label_word_overlap,
     result_from_dict,
 )
+from realtime_eval.core.power import DeviceSampler
 from realtime_eval.pipeline.analyze import best_config
+from vlm_eval.hardware import get_gpu_power_watts
 from vlm_eval.inference.gemma import HuggingFaceVLM, _first_token_streamer_cls
 
 # Deliberately word-shaped: the first token has no trailing space, which is
@@ -336,6 +338,81 @@ def check_all_error_config_still_reported() -> None:
     assert summary.meets_realtime_p95 is None, summary
 
 
+# --- power and energy (S8) ------------------------------------------------
+
+
+def check_energy_integration() -> None:
+    """Energy must be a proper time integral, and mean power time-weighted."""
+    sampler = DeviceSampler(interval_sec=0.01)
+    # Hand-place samples: 100 W for 1 s, then ramp to 300 W over the next 1 s.
+    # Trapezoid: 100*1 + (100+300)/2*1 = 300 J over a 2 s span -> 150 W mean.
+    sampler._samples = [(0.0, 100.0), (1.0, 100.0), (2.0, 300.0)]
+
+    assert abs(sampler.energy_j - 300.0) < 1e-9, sampler.energy_j
+    assert abs(sampler.sampled_sec - 2.0) < 1e-9
+    assert abs(sampler.mean_watts - 150.0) < 1e-9, sampler.mean_watts
+    assert sampler.peak_watts == 300.0
+    assert sampler.n_power_samples == 3
+
+    # An unweighted mean of the readings would give 166.7 W -- biased by the
+    # uneven spacing. That is the bug the time weighting removes.
+    naive = sum(w for _t, w in sampler._samples) / 3
+    assert abs(naive - 166.667) < 0.01 and abs(naive - sampler.mean_watts) > 15, naive
+
+
+def check_single_sample_is_not_integrated() -> None:
+    """One reading spans no time, so energy is unavailable rather than wrong."""
+    sampler = DeviceSampler()
+    sampler._samples = [(0.0, 120.0)]
+    assert sampler.energy_j is None
+    assert sampler.sampled_sec is None
+    assert sampler.mean_watts == 120.0, "still report the lone reading"
+    assert sampler.n_power_samples == 1, "caller can see it is untrustworthy"
+
+    empty = DeviceSampler()
+    assert empty.energy_j is None and empty.mean_watts is None and empty.peak_watts is None
+
+
+def check_power_aggregates_by_total_energy() -> None:
+    """Mean power over runs must be total energy / total time, not mean of means."""
+    # Run A: 10 J over 1 s (10 W). Run B: 300 J over 10 s (30 W).
+    # Correct: 310 J / 11 s = 28.2 W. Mean of means would say 20 W.
+    a = _synth(8, energy_j=10.0, power_sampled_sec=1.0, mean_power_watts=10.0)
+    b = _synth(8, video="b.mp4", energy_j=300.0, power_sampled_sec=10.0, mean_power_watts=30.0)
+    (summary,) = aggregate([a, b])
+
+    assert abs(summary.mean_power_watts - 310.0 / 11.0) < 1e-9, summary.mean_power_watts
+    assert abs(summary.mean_power_watts - 20.0) > 5.0, "must not be the mean of means"
+    assert abs(summary.mean_energy_j - 155.0) < 1e-9, summary.mean_energy_j
+
+
+def check_vram_reports_both_views() -> None:
+    """Allocator reserved and device-wide used are distinct, both reported."""
+    a = _synth(8, peak_vram_reserved_gb=4.0, peak_vram_device_gb=4.7)
+    b = _synth(8, video="b.mp4", peak_vram_reserved_gb=6.0, peak_vram_device_gb=6.8)
+    (summary,) = aggregate([a, b])
+
+    assert abs(summary.mean_peak_vram_reserved_gb - 5.0) < 1e-9, summary
+    # Device-wide is a max, not a mean: sizing hardware needs the worst case.
+    assert abs(summary.max_peak_vram_device_gb - 6.8) < 1e-9, summary
+    assert summary.max_peak_vram_device_gb > summary.mean_peak_vram_reserved_gb
+
+
+def check_power_reading_is_cheap() -> None:
+    """Sampling must not cost enough to perturb the region being measured."""
+    get_gpu_power_watts()  # warm the NVML handle
+    start = time.perf_counter()
+    for _ in range(20):
+        get_gpu_power_watts()
+    per_call_ms = (time.perf_counter() - start) / 20 * 1000
+
+    # The nvidia-smi subprocess this replaced measured ~32 ms/call on this box.
+    # Only assert when a reading is actually available (NVML present).
+    if get_gpu_power_watts() is not None:
+        assert per_call_ms < 5.0, f"{per_call_ms:.1f} ms/call is too slow to sample"
+    print(f"  power reading: {per_call_ms:.3f} ms/call")
+
+
 # --- quality axis (C3) ----------------------------------------------------
 
 
@@ -391,6 +468,11 @@ def demo() -> None:
     check_window_rtf_drives_the_verdict()
     check_failures_are_counted_and_gate_the_verdict()
     check_all_error_config_still_reported()
+    check_energy_integration()
+    check_single_sample_is_not_integrated()
+    check_power_aggregates_by_total_energy()
+    check_vram_reports_both_views()
+    check_power_reading_is_cheap()
     check_overlap_scored_once_per_video()
     check_overlap_is_verbosity_confounded()
     check_best_config_ignores_overlap()
