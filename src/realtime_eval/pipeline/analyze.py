@@ -55,7 +55,8 @@ def format_table(summaries: list[ConfigSummary]) -> str:
     """
     header = (
         f"{'model':<18}{'frames':>7}{'tok':>5}{'p50_e2e':>9}{'p95_e2e':>9}"
-        f"{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}{'p95_rtf':>9}{'acc':>7}{'RT?':>5}"
+        f"{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}{'p95_rtf':>9}"
+        f"{'toks':>7}{'ovlp':>7}{'n':>4}{'RT?':>5}"
     )
     lines = [header, "-" * len(header)]
     for s in sorted(summaries, key=lambda x: (x.model_id, x.num_frames, x.max_new_tokens)):
@@ -69,7 +70,9 @@ def format_table(summaries: list[ConfigSummary]) -> str:
             f"{_fmt(s.p95_ttft_ms, '.0f'):>10}"
             f"{_fmt(s.mean_tpot_ms, '.1f'):>7}"
             f"{_fmt(s.p95_rtf_inv):>9}"
-            f"{_fmt(s.accuracy):>7}"
+            f"{_fmt(s.mean_tokens, '.0f'):>7}"
+            f"{_fmt(s.naive_word_overlap):>7}"
+            f"{s.n_videos_scored:>4}"
             f"{rt:>5}"
         )
     return "\n".join(lines)
@@ -105,11 +108,16 @@ def format_scaling_table(fits: list[FrameScaling]) -> str:
 
 
 def best_config(summaries: list[ConfigSummary]) -> ConfigSummary | None:
-    """Pick the highest-accuracy config that meets the real-time threshold.
+    """Pick the most capable config that still meets the real-time threshold.
 
-    Among configs with ``meets_realtime_p95`` True, returns the one with the
-    highest accuracy, breaking ties toward more frames (more capacity) then
-    lower p95 latency.
+    Ranks on frame count -- the most temporal evidence the model gets per
+    inference -- breaking ties toward lower p95 latency.
+
+    Deliberately does **not** rank on ``naive_word_overlap``. That proxy rewards
+    verbosity, so it rises with ``max_new_tokens``, which is itself a swept axis;
+    ranking on it would recommend whichever config was allowed to talk longest.
+    Restore quality-based ranking only once ``vlm_eval.judge`` supplies real
+    scores.
 
     Args:
         summaries: Aggregated config summaries.
@@ -122,11 +130,7 @@ def best_config(summaries: list[ConfigSummary]) -> ConfigSummary | None:
         return None
     return max(
         realtime,
-        key=lambda s: (
-            s.accuracy if s.accuracy is not None else -1.0,
-            s.num_frames,
-            -(s.p95_e2e_latency_ms or 0.0),
-        ),
+        key=lambda s: (s.num_frames, -(s.p95_e2e_latency_ms or 0.0)),
     )
 
 
@@ -155,8 +159,10 @@ def analyze(run_dir: Path, threshold: float = 0.8) -> str:
         verdict = (
             f"\nRecommended: {model_name_from_id(pick.model_id)} | "
             f"{pick.num_frames} frames | max_new_tokens={pick.max_new_tokens}\n"
-            f"  p95 rtf_inv={_fmt(pick.p95_rtf_inv)} (<= {threshold}), "
-            f"accuracy={_fmt(pick.accuracy)}, "
-            f"p95 latency={_fmt(pick.p95_e2e_latency_ms, '.0f')} ms"
+            f"  Most frames among configs meeting p95 rtf_inv <= {threshold} "
+            f"(p95={_fmt(pick.p95_rtf_inv)}, p95 latency="
+            f"{_fmt(pick.p95_e2e_latency_ms, '.0f')} ms).\n"
+            "  Quality is NOT ranked: ovlp is a verbosity-confounded proxy, not "
+            "accuracy. Wire up the LLM judge before choosing on quality."
         )
     return f"{table}\n\nFrame scaling (marginal cost per added frame):\n{scaling}\n{verdict}"

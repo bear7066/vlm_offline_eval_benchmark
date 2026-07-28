@@ -43,7 +43,9 @@ class RealtimeResult:
         peak_power_watts: Peak GPU power over the inference.
         peak_vram_gb: Peak VRAM allocated during the inference.
         response: Model output text.
-        correct: Whether the response matched the label (heuristic; may be None).
+        label_word_overlap: Whether the response contained a label content word.
+            A verbosity-confounded proxy, not correctness -- see
+            :func:`label_word_overlap`.
         status: ``"success"`` or ``"error"``.
         error: Error message when ``status == "error"``.
     """
@@ -72,7 +74,7 @@ class RealtimeResult:
     peak_power_watts: float | None = None
     peak_vram_gb: float | None = None
     response: str = ""
-    correct: bool | None = None
+    label_word_overlap: bool | None = None
     status: str = "success"
     error: str | None = None
 
@@ -106,20 +108,30 @@ def percentile(values: list[float], q: float) -> float | None:
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
-def naive_correct(response: str, label: str) -> bool:
-    """Heuristic accuracy: does the response share label content words?
+def label_word_overlap(response: str, label: str) -> bool:
+    """Does the response contain any content word from the label?
 
-    This is a placeholder so the sweep is runnable without an LLM judge.
-    It lowercases both strings, drops short stopword-like tokens, and checks
-    whether any label content word appears in the response. Replace with the
-    ``vlm_eval.judge`` pipeline before trusting the accuracy axis.
+    A crude proxy so the sweep is runnable without an LLM judge -- **not
+    accuracy**, and not safe to rank configs by:
+
+    - It rewards verbosity. A longer response has strictly more chances to hit
+      a label word, so raising ``max_new_tokens`` raises this score for free.
+      Since ``max_new_tokens`` is a swept axis, the metric is confounded with
+      the very thing the sweep varies. Read it next to ``mean_tokens``.
+    - It ignores meaning entirely: a response that names the label while
+      describing the opposite event still counts as a hit.
+    - It is meaningless when the prompt and the labels use different
+      vocabularies, e.g. an accident-detection prompt against action labels.
+
+    Replace with the ``vlm_eval.judge`` pipeline before drawing any quality
+    conclusion.
 
     Args:
         response: Model output text.
         label: Ground-truth label (underscores treated as spaces).
 
     Returns:
-        True if any label content word is present in the response.
+        True if any label content word (longer than two characters) is present.
     """
     resp_words = set(_WORD_RE.findall(response.lower()))
     label_words = {
@@ -292,7 +304,8 @@ class ConfigSummary:
     mean_tokens: float | None
     mean_peak_vram_gb: float | None
     mean_power_watts: float | None
-    accuracy: float | None
+    n_videos_scored: int
+    naive_word_overlap: float | None
     meets_realtime_p95: bool | None
 
     def to_dict(self) -> dict[str, Any]:
@@ -338,7 +351,14 @@ def aggregate(results: list[RealtimeResult], threshold: float = 0.8) -> list[Con
         latencies = column(items, "e2e_latency_ms")
         ttfts = column(items, "ttft_ms")
         rtfs = column(items, "rtf_inv")
-        correct = [r.correct for r in items if r.correct is not None]
+        # Decoding is greedy, so repeats of a video are byte-identical and add
+        # no information. Score each video once, or the denominator is inflated
+        # by a factor of `repeats` while the effective sample size is n_videos.
+        scored = [
+            r.label_word_overlap
+            for r in items
+            if r.repeat_index == 0 and r.label_word_overlap is not None
+        ]
         p95_rtf = percentile(rtfs, 95)
         summaries.append(
             ConfigSummary(
@@ -362,7 +382,8 @@ def aggregate(results: list[RealtimeResult], threshold: float = 0.8) -> list[Con
                 mean_tokens=_mean(column(items, "tokens")),
                 mean_peak_vram_gb=_mean(column(items, "peak_vram_gb")),
                 mean_power_watts=_mean(column(items, "mean_power_watts")),
-                accuracy=(sum(correct) / len(correct)) if correct else None,
+                n_videos_scored=len(scored),
+                naive_word_overlap=(sum(scored) / len(scored)) if scored else None,
                 meets_realtime_p95=(p95_rtf <= threshold) if p95_rtf is not None else None,
             )
         )

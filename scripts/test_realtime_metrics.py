@@ -19,8 +19,10 @@ from realtime_eval.core.metrics import (
     RealtimeResult,
     aggregate,
     fit_frame_scaling,
+    label_word_overlap,
     result_from_dict,
 )
+from realtime_eval.pipeline.analyze import best_config
 from vlm_eval.inference.gemma import HuggingFaceVLM, _first_token_streamer_cls
 
 # Deliberately word-shaped: the first token has no trailing space, which is
@@ -200,7 +202,7 @@ def _synth(frames: int, tokens: int = 20, **over) -> RealtimeResult:
         decode_ms=decode,
         e2e_latency_ms=preprocess + prefill + decode,
         rtf_inv=0.5,
-        correct=True,
+        label_word_overlap=True,
     )
     fields.update(over)
     return RealtimeResult(**fields)
@@ -269,6 +271,47 @@ def check_aggregate_and_schema() -> None:
         raise AssertionError("expected stale schema fields to be rejected")
 
 
+# --- quality axis (C3) ----------------------------------------------------
+
+
+def check_overlap_scored_once_per_video() -> None:
+    """Greedy repeats are identical, so they must not inflate the denominator."""
+    items = [_synth(8, repeat_index=i) for i in range(5)]
+    items += [_synth(8, video="b.mp4", repeat_index=i, label_word_overlap=False) for i in range(5)]
+    (summary,) = aggregate(items)
+
+    assert summary.n_runs == 10, summary  # latency still uses every run
+    assert summary.n_videos_scored == 2, summary  # quality uses each video once
+    assert summary.naive_word_overlap == 0.5, summary
+
+
+def check_overlap_is_verbosity_confounded() -> None:
+    """The proxy rises with response length, so it tracks the swept token cap."""
+    label = "fall_general"
+    terse = "everything is normal"
+    verbose = "everything is normal, no fall or general incident is visible here"
+    assert label_word_overlap(terse, label) is False
+    assert label_word_overlap(verbose, label) is True, "longer text hits by chance"
+
+
+def check_best_config_ignores_overlap() -> None:
+    """Ranking must follow frames, not the placeholder quality proxy."""
+    low_frames_high_overlap = [_synth(8)]
+    high_frames_low_overlap = [_synth(16, label_word_overlap=False)]
+    summaries = aggregate(low_frames_high_overlap + high_frames_low_overlap)
+
+    by_frames = {s.num_frames: s for s in summaries}
+    assert by_frames[8].naive_word_overlap == 1.0
+    assert by_frames[16].naive_word_overlap == 0.0
+
+    pick = best_config(summaries)
+    assert pick is not None and pick.num_frames == 16, pick
+
+    # Nothing is recommended when no config is fast enough.
+    infeasible = aggregate([_synth(8, rtf_inv=5.0)], threshold=0.8)
+    assert best_config(infeasible) is None
+
+
 def demo() -> None:
     check_first_token_timestamp()
     check_phase_split()
@@ -279,6 +322,9 @@ def demo() -> None:
     check_scaling_needs_two_points()
     check_scaling_uses_actual_frames()
     check_aggregate_and_schema()
+    check_overlap_scored_once_per_video()
+    check_overlap_is_verbosity_confounded()
+    check_best_config_ignores_overlap()
     print("ok")
 
 

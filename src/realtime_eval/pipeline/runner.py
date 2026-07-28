@@ -8,7 +8,7 @@ from vlm_eval.hardware import get_peak_vram_gb, reset_peak_memory_stats
 from vlm_eval.inference.gemma import HuggingFaceVLM
 from vlm_eval.video import sample_frames
 
-from realtime_eval.core.metrics import RealtimeResult, naive_correct
+from realtime_eval.core.metrics import RealtimeResult, label_word_overlap
 from realtime_eval.core.power import PowerSampler
 
 logger = logging.getLogger(__name__)
@@ -193,7 +193,7 @@ def run_config(
                     peak_power_watts=peak_w,
                     peak_vram_gb=peak_vram,
                     response=response,
-                    correct=naive_correct(response, label),
+                    label_word_overlap=label_word_overlap(response, label),
                 )
             )
     return results
