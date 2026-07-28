@@ -5,6 +5,11 @@ from dataclasses import asdict, dataclass, field, fields
 from statistics import StatisticsError, fmean, linear_regression
 from typing import Any
 
+# Bumped whenever a metric's definition or name changes, so a run directory
+# records which definitions produced it. Results from different versions are
+# not comparable.
+SCHEMA_VERSION = 2
+
 
 @dataclass
 class RealtimeResult:

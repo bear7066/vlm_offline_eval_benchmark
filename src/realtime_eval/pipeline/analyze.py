@@ -158,6 +158,15 @@ def analyze(run_dir: Path, threshold: float = 0.8, min_success_rate: float = 1.0
     table = format_table(summaries)
     scaling = format_scaling_table(fit_frame_scaling(results))
 
+    thin = [s for s in summaries if 0 < s.n_success < 20]
+    caveat = (
+        f"\nNote: {len(thin)} config(s) have fewer than 20 successful runs, so "
+        "their p95 is\neffectively the max -- compare it against the max_e2e "
+        "column rather than reading it as a percentile."
+        if thin
+        else ""
+    )
+
     windows = {s.window_sec for s in summaries if s.window_sec is not None}
     window = f"{windows.pop():g}s" if len(windows) == 1 else "the configured window"
 
@@ -190,5 +199,5 @@ def analyze(run_dir: Path, threshold: float = 0.8, min_success_rate: float = 1.0
     )
     return (
         f"{table}\n\nFrame scaling (marginal cost per added frame):\n{scaling}\n"
-        f"{verdict}\n{legend}"
+        f"{verdict}\n{legend}{caveat}"
     )

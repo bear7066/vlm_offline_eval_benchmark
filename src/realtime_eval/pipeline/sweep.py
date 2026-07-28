@@ -15,8 +15,8 @@ from vlm_eval.paths import model_name_from_id, slugify
 
 from realtime_eval.core.config import SweepConfig
 from realtime_eval.core.dataset import discover_videos
-from realtime_eval.core.metrics import RealtimeResult, aggregate
-from realtime_eval.pipeline.runner import load_model, run_config
+from realtime_eval.core.metrics import SCHEMA_VERSION, RealtimeResult, aggregate
+from realtime_eval.pipeline.runner import build_sample_cache, load_model, run_config
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,7 @@ def run_sweep(
     _write_json(
         run_dir / "config.json",
         {
+            "schema_version": SCHEMA_VERSION,
             "videos_root": str(videos_root),
             "num_videos": len(videos),
             "hardware_name": hardware_name,
@@ -171,6 +172,8 @@ def run_sweep(
             continue
 
         for num_frames in config.num_frames_grid:
+            # Decode once per frame count, not once per (frames, tokens) pair.
+            frame_cache = build_sample_cache(videos, num_frames)
             for max_new_tokens in config.max_new_tokens_grid:
                 logger.info(
                     "Config: %s | frames=%d | max_new_tokens=%d",
@@ -189,6 +192,7 @@ def run_sweep(
                     warmup=config.warmup,
                     window_sec=config.window_sec,
                     power_interval_sec=config.power_sample_interval_sec,
+                    cache=frame_cache,
                 )
                 for result in results:
                     _append_jsonl(results_path, result.to_dict())
@@ -213,6 +217,7 @@ def run_sweep(
     _write_json(
         run_dir / "summary.json",
         {
+            "schema_version": SCHEMA_VERSION,
             "hardware_name": hardware_name,
             "window_sec": config.window_sec,
             "realtime_threshold": config.realtime_threshold,

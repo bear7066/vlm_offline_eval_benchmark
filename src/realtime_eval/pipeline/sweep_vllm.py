@@ -140,11 +140,22 @@ class VLLMModel:
 
         Returns:
             Dict with the keys ``response``, ``elapsed_sec``, ``elapsed_ms``,
-            ``ttft_ms``, ``tokens``, ``throughput_tps`` and
+            ``ttft_ms``, ``tokens``, ``throughput_tps``, ``ttft_source`` and
             ``average_power_watts``. ``ttft_ms`` is taken from vLLM's request
             metrics (populated because the engine is built with
             ``disable_log_stats=False``), else ``None``.
+
+            ``preprocess_ms`` and ``prefill_ms`` are **not** reported: the
+            engine preprocesses images inside ``generate`` and its TTFT is
+            measured from request arrival, so the phase split that the
+            transformers backend guarantees does not hold here. ``ttft_source``
+            records the difference; do not compare TTFT across backends without
+            checking it.
         """
+        # Timed from chat templating onward, to cover the same span as the
+        # transformers backend (which includes preprocessing).
+        start_time = time.perf_counter()
+
         content_items: list[dict[str, Any]] = [{"type": "image"} for _ in range(len(frames))]
         content_items.append({"type": "text", "text": prompt_text})
         messages = [{"role": "user", "content": content_items}]
@@ -157,13 +168,12 @@ class VLLMModel:
 
         sampling = self._sampling_params_cls(temperature=0.0, max_tokens=max_new_tokens)
 
-        start_time = time.time()
         outputs = self.llm.generate(
             {"prompt": formatted_prompt, "multi_modal_data": {"image": list(frames)}},
             sampling_params=sampling,
             use_tqdm=False,
         )
-        elapsed_sec = time.time() - start_time
+        elapsed_sec = time.perf_counter() - start_time
 
         completion = outputs[0].outputs[0]
         response = completion.text.strip()
@@ -189,6 +199,7 @@ class VLLMModel:
             "ttft_ms": ttft_ms,
             "tokens": num_tokens,
             "throughput_tps": num_tokens / elapsed_sec if elapsed_sec > 0 else 0.0,
+            "ttft_source": "engine-metrics" if ttft_ms is not None else None,
             "average_power_watts": None,
         }
 

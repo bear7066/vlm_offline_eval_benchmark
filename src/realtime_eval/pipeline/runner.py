@@ -27,7 +27,7 @@ def load_model(model_id: str, hf_token: str | None = None) -> HuggingFaceVLM:
     return HuggingFaceVLM(model_id, hf_token=hf_token)
 
 
-def _sample_cache(
+def build_sample_cache(
     videos: list[tuple[Path, str]],
     num_frames: int,
 ) -> dict[Path, tuple[list[Any], float | None]]:
@@ -105,6 +105,7 @@ def run_config(
     warmup: int,
     window_sec: float = 1.0,
     power_interval_sec: float = 0.1,
+    cache: dict[Path, tuple[list[Any], float | None]] | None = None,
 ) -> list[RealtimeResult]:
     """Benchmark one ``(num_frames, max_new_tokens)`` config over a video set.
 
@@ -123,11 +124,15 @@ def run_config(
         warmup: Discarded iterations before timing.
         window_sec: Deployment stride the real-time verdict is judged against.
         power_interval_sec: Background power sampling period.
+        cache: Pre-decoded frames from :func:`build_sample_cache` for this
+            frame count. Pass it to avoid re-decoding the video set once per
+            ``max_new_tokens`` value; decoded here when omitted.
 
     Returns:
         One :class:`RealtimeResult` per ``(video, repeat)``.
     """
-    cache = _sample_cache(videos, num_frames)
+    if cache is None:
+        cache = build_sample_cache(videos, num_frames)
     label_by_path = {path: label for path, label in videos}
 
     # Warmup on the first available video; results discarded.
@@ -169,10 +174,19 @@ def run_config(
 
             latency_ms = generated["elapsed_ms"]
             ttft_ms = generated["ttft_ms"]
-            # Backends that report no phase split (vLLM) still give the total.
+            tokens = generated["tokens"]
+            # Backends that report no phase split (vLLM) still give the total,
+            # so derive the decode metrics here rather than in each backend.
             decode_ms = generated.get("decode_ms")
             if decode_ms is None and latency_ms is not None and ttft_ms is not None:
                 decode_ms = latency_ms - ttft_ms
+            gaps = (tokens - 1) if tokens else 0
+            tpot_ms = generated.get("tpot_ms")
+            if tpot_ms is None and decode_ms is not None and gaps > 0:
+                tpot_ms = decode_ms / gaps
+            decode_tps = generated.get("decode_tps")
+            if decode_tps is None and decode_ms is not None and decode_ms > 0 and gaps > 0:
+                decode_tps = gaps / (decode_ms / 1000.0)
             elapsed_sec = generated["elapsed_sec"]
             rtf = (
                 (elapsed_sec / duration_sec) if duration_sec and duration_sec > 0 else None
@@ -194,8 +208,8 @@ def run_config(
                     prefill_ms=generated.get("prefill_ms"),
                     ttft_ms=ttft_ms,
                     decode_ms=decode_ms,
-                    tpot_ms=generated.get("tpot_ms"),
-                    decode_tps=generated.get("decode_tps"),
+                    tpot_ms=tpot_ms,
+                    decode_tps=decode_tps,
                     throughput_tps=generated["throughput_tps"],
                     ttft_source=generated.get("ttft_source"),
                     window_sec=window_sec,
@@ -203,7 +217,7 @@ def run_config(
                     max_sustainable_fps=sustainable_fps,
                     rtf=rtf,
                     video_duration_sec=duration_sec,
-                    tokens=generated["tokens"],
+                    tokens=tokens,
                     response=response,
                     label_word_overlap=label_word_overlap(response, label),
                     **device,
