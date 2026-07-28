@@ -15,6 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import torch
 
+from realtime_eval.core.metrics import (
+    RealtimeResult,
+    aggregate,
+    fit_frame_scaling,
+    result_from_dict,
+)
 from vlm_eval.inference.gemma import HuggingFaceVLM, _first_token_streamer_cls
 
 # Deliberately word-shaped: the first token has no trailing space, which is
@@ -169,11 +175,110 @@ def check_generate_error_propagates() -> None:
         raise AssertionError("expected the generate failure to propagate")
 
 
+# --- frame scaling (C2) ---------------------------------------------------
+
+PREFILL_SLOPE = 12.0  # ms per frame
+PREFILL_FIXED = 40.0  # ms of frame-independent cost
+PREPROCESS_SLOPE = 3.0  # ms per frame of CPU preprocessing
+
+
+def _synth(frames: int, tokens: int = 20, **over) -> RealtimeResult:
+    """A successful result whose latency follows the known linear model."""
+    prefill = PREFILL_FIXED + PREFILL_SLOPE * frames
+    preprocess = PREPROCESS_SLOPE * frames
+    decode = 100.0
+    fields = dict(
+        video=f"v{frames}.mp4",
+        label="fall_general",
+        model_id="m/one",
+        num_frames=frames,
+        num_frames_actual=frames,
+        max_new_tokens=tokens,
+        preprocess_ms=preprocess,
+        prefill_ms=prefill,
+        ttft_ms=preprocess + prefill,
+        decode_ms=decode,
+        e2e_latency_ms=preprocess + prefill + decode,
+        rtf_inv=0.5,
+        correct=True,
+    )
+    fields.update(over)
+    return RealtimeResult(**fields)
+
+
+def check_frame_scaling_recovers_slope() -> None:
+    """The fit must recover the true marginal cost and separate fixed overhead."""
+    results = [_synth(f) for f in (8, 12, 16)]
+    (fit,) = fit_frame_scaling(results)
+
+    assert fit.n_points == 3, fit
+    assert fit.frame_counts == [8, 12, 16], fit
+    assert abs(fit.prefill_ms_per_frame - PREFILL_SLOPE) < 1e-9, fit
+    assert abs(fit.prefill_fixed_ms - PREFILL_FIXED) < 1e-9, fit
+    assert abs(fit.prefill_fit_r2 - 1.0) < 1e-9, fit
+    # TTFT scaling picks up preprocessing on top of prefill.
+    assert abs(fit.ttft_ms_per_frame - (PREFILL_SLOPE + PREPROCESS_SLOPE)) < 1e-9, fit
+    assert abs(fit.ttft_fixed_ms - PREFILL_FIXED) < 1e-9, fit
+
+
+def check_slope_beats_naive_ratio() -> None:
+    """The old ttft/num_frames metric drifts across the grid; the slope does not."""
+    naive = [(PREFILL_FIXED + PREFILL_SLOPE * f) / f for f in (8, 12, 16)]
+    assert naive[0] > naive[1] > naive[2], naive  # monotone drift, not a constant
+    assert max(naive) - min(naive) > 2.0, naive  # and not a rounding-level drift
+
+    # Same data, fitted: one number, equal to the true per-frame cost.
+    (fit,) = fit_frame_scaling([_synth(f) for f in (8, 12, 16)])
+    assert abs(fit.prefill_ms_per_frame - PREFILL_SLOPE) < 1e-9, fit
+    assert all(abs(fit.prefill_ms_per_frame - n) > 2.0 for n in naive), (fit, naive)
+
+
+def check_scaling_needs_two_points() -> None:
+    """A single frame count yields no slope, and says so rather than guessing."""
+    (fit,) = fit_frame_scaling([_synth(8), _synth(8, video="other.mp4")])
+    assert fit.n_points == 1, fit
+    assert fit.prefill_ms_per_frame is None, fit
+    assert fit.ttft_fit_r2 is None, fit
+
+
+def check_scaling_uses_actual_frames() -> None:
+    """Short clips feed fewer frames; the fit must use what was actually fed."""
+    # Requested 16 but only 10 frames existed: grouped and fitted at 10.
+    results = [_synth(8), _synth(16, num_frames_actual=10, num_frames=16)]
+    (fit,) = fit_frame_scaling(results)
+    assert fit.frame_counts == [8, 10], fit
+
+
+def check_aggregate_and_schema() -> None:
+    """Aggregation reads the new fields; stale records are rejected loudly."""
+    (summary,) = aggregate([_synth(8), _synth(8, video="b.mp4")], threshold=0.8)
+    assert summary.n_runs == 2, summary
+    assert summary.num_frames_actual == 8, summary
+    assert abs(summary.mean_prefill_ms - (PREFILL_FIXED + PREFILL_SLOPE * 8)) < 1e-9, summary
+    assert summary.p95_e2e_latency_ms is not None and summary.max_e2e_latency_ms is not None
+    assert summary.meets_realtime_p95 is True, summary
+
+    # Records from the pre-fix schema must not be silently reinterpreted.
+    good = _synth(8).to_dict()
+    assert result_from_dict(good).num_frames == 8
+    try:
+        result_from_dict({**good, "prefill_ms_per_frame": 17.0})
+    except ValueError as exc:
+        assert "prefill_ms_per_frame" in str(exc), exc
+    else:
+        raise AssertionError("expected stale schema fields to be rejected")
+
+
 def demo() -> None:
     check_first_token_timestamp()
     check_phase_split()
     check_token_count()
     check_generate_error_propagates()
+    check_frame_scaling_recovers_slope()
+    check_slope_beats_naive_ratio()
+    check_scaling_needs_two_points()
+    check_scaling_uses_actual_frames()
+    check_aggregate_and_schema()
     print("ok")
 
 

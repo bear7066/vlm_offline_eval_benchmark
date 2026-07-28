@@ -146,6 +146,7 @@ def run_config(
                         label=label,
                         model_id=model_id,
                         num_frames=num_frames,
+                        num_frames_actual=len(frames),
                         max_new_tokens=max_new_tokens,
                         repeat_index=repeat_index,
                         status="error",
@@ -156,9 +157,10 @@ def run_config(
 
             latency_ms = generated["elapsed_ms"]
             ttft_ms = generated["ttft_ms"]
-            decode_ms = (
-                latency_ms - ttft_ms if latency_ms is not None and ttft_ms is not None else None
-            )
+            # Backends that report no phase split (vLLM) still give the total.
+            decode_ms = generated.get("decode_ms")
+            if decode_ms is None and latency_ms is not None and ttft_ms is not None:
+                decode_ms = latency_ms - ttft_ms
             rtf_inv = (
                 (generated["elapsed_sec"] / duration_sec)
                 if duration_sec and duration_sec > 0
@@ -171,17 +173,22 @@ def run_config(
                     label=label,
                     model_id=model_id,
                     num_frames=num_frames,
+                    num_frames_actual=len(frames),
                     max_new_tokens=max_new_tokens,
                     repeat_index=repeat_index,
-                    query_latency_ms=latency_ms,
+                    e2e_latency_ms=latency_ms,
+                    preprocess_ms=generated.get("preprocess_ms"),
+                    prefill_ms=generated.get("prefill_ms"),
                     ttft_ms=ttft_ms,
                     decode_ms=decode_ms,
-                    prefill_ms_per_frame=(ttft_ms / num_frames if ttft_ms is not None else None),
+                    tpot_ms=generated.get("tpot_ms"),
+                    decode_tps=generated.get("decode_tps"),
+                    throughput_tps=generated["throughput_tps"],
+                    ttft_source=generated.get("ttft_source"),
                     rtf_inv=rtf_inv,
                     meets_realtime=(rtf_inv <= 1.0 if rtf_inv is not None else None),
                     video_duration_sec=duration_sec,
                     tokens=generated["tokens"],
-                    throughput_tps=generated["throughput_tps"],
                     mean_power_watts=mean_w,
                     peak_power_watts=peak_w,
                     peak_vram_gb=peak_vram,
