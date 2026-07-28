@@ -39,8 +39,16 @@ class SweepConfig:
             to absorb CUDA autotuning and lazy initialization.
         output_root: Parent directory for run outputs.
         prompt: Instruction sent with the sampled frames.
-        realtime_threshold: Target p95 ``rtf_inv`` a config must satisfy to be
-            considered real time (0.8 leaves headroom under the 1.0 limit).
+        window_sec: The deployment contract -- one inference per ``window_sec``
+            of incoming video, sampling ``num_frames`` from that window. This is
+            the denominator of ``window_rtf``, so it must match the stride the
+            system will actually run at. Judging against clip duration instead
+            would make the verdict depend on how long the benchmark clips
+            happen to be, since frame count (and so compute) is fixed.
+        realtime_threshold: Target p95 ``window_rtf`` a config must satisfy to
+            be considered real time (0.8 leaves headroom under the 1.0 limit).
+        min_success_rate: Fraction of runs that must succeed before a config can
+            qualify as real time.
         power_sample_interval_sec: Sampling period for the background GPU power
             sampler.
     """
@@ -52,7 +60,9 @@ class SweepConfig:
     warmup: int = 2
     output_root: Path = Path("realtime_runs")
     prompt: str = DEFAULT_REALTIME_PROMPT
+    window_sec: float = 1.0
     realtime_threshold: float = 0.8
+    min_success_rate: float = 1.0
     power_sample_interval_sec: float = 0.1
 
     def configs(self) -> list[tuple[str, int, int]]:
@@ -135,6 +145,8 @@ class SweepConfig:
             "warmup": self.warmup,
             "output_root": str(self.output_root),
             "prompt": self.prompt,
+            "window_sec": self.window_sec,
             "realtime_threshold": self.realtime_threshold,
+            "min_success_rate": self.min_success_rate,
             "power_sample_interval_sec": self.power_sample_interval_sec,
         }

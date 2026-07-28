@@ -184,7 +184,7 @@ PREFILL_FIXED = 40.0  # ms of frame-independent cost
 PREPROCESS_SLOPE = 3.0  # ms per frame of CPU preprocessing
 
 
-def _synth(frames: int, tokens: int = 20, **over) -> RealtimeResult:
+def _synth(frames: int, max_tokens: int = 20, **over) -> RealtimeResult:
     """A successful result whose latency follows the known linear model."""
     prefill = PREFILL_FIXED + PREFILL_SLOPE * frames
     preprocess = PREPROCESS_SLOPE * frames
@@ -195,13 +195,16 @@ def _synth(frames: int, tokens: int = 20, **over) -> RealtimeResult:
         model_id="m/one",
         num_frames=frames,
         num_frames_actual=frames,
-        max_new_tokens=tokens,
+        max_new_tokens=max_tokens,
         preprocess_ms=preprocess,
         prefill_ms=prefill,
         ttft_ms=preprocess + prefill,
         decode_ms=decode,
         e2e_latency_ms=preprocess + prefill + decode,
-        rtf_inv=0.5,
+        window_sec=1.0,
+        window_rtf=0.5,
+        max_sustainable_fps=float(frames) / 0.5,
+        rtf=0.5,
         label_word_overlap=True,
     )
     fields.update(over)
@@ -254,7 +257,7 @@ def check_scaling_uses_actual_frames() -> None:
 def check_aggregate_and_schema() -> None:
     """Aggregation reads the new fields; stale records are rejected loudly."""
     (summary,) = aggregate([_synth(8), _synth(8, video="b.mp4")], threshold=0.8)
-    assert summary.n_runs == 2, summary
+    assert summary.n_success == 2, summary
     assert summary.num_frames_actual == 8, summary
     assert abs(summary.mean_prefill_ms - (PREFILL_FIXED + PREFILL_SLOPE * 8)) < 1e-9, summary
     assert summary.p95_e2e_latency_ms is not None and summary.max_e2e_latency_ms is not None
@@ -271,6 +274,68 @@ def check_aggregate_and_schema() -> None:
         raise AssertionError("expected stale schema fields to be rejected")
 
 
+# --- real-time criterion (C4) and reliability (C5) ------------------------
+
+
+def check_window_rtf_is_duration_independent() -> None:
+    """Identical work on clips of different lengths must get the same verdict."""
+    # Same latency (400 ms), same frame count, different clip durations.
+    short = _synth(8, e2e_latency_ms=400.0, window_rtf=0.4, rtf=0.4 / 1.0, video_duration_sec=1.0)
+    long = _synth(8, e2e_latency_ms=400.0, window_rtf=0.4, rtf=0.4 / 10.0, video_duration_sec=10.0)
+
+    # rtf disagrees by 10x purely because of clip length -- the old confound.
+    assert abs(short.rtf / long.rtf - 10.0) < 1e-9, (short.rtf, long.rtf)
+    # window_rtf is identical, because the deployment stride is what matters.
+    assert short.window_rtf == long.window_rtf
+
+    (summary,) = aggregate([short, long], threshold=0.8)
+    assert summary.p95_window_rtf == 0.4, summary
+    assert summary.meets_realtime_p95 is True, summary
+    assert summary.window_sec == 1.0, summary
+
+
+def check_window_rtf_drives_the_verdict() -> None:
+    """A config slower than its stride must fail, however short the clips are."""
+    # 2 s of work per 1 s window: not real time, even though rtf looks fine
+    # against a 30 s clip.
+    slow = _synth(8, e2e_latency_ms=2000.0, window_rtf=2.0, rtf=2.0 / 30.0, video_duration_sec=30.0)
+    (summary,) = aggregate([slow], threshold=0.8)
+    assert summary.p95_rtf < 0.1, summary  # would have passed on the old metric
+    assert summary.meets_realtime_p95 is False, summary
+
+
+def check_failures_are_counted_and_gate_the_verdict() -> None:
+    """Crashed runs must not vanish, and must disqualify a real-time claim."""
+    items = [_synth(8, repeat_index=0), _synth(8, repeat_index=1)]
+    items += [
+        _synth(8, repeat_index=i, status="error", error="CUDA out of memory")
+        for i in range(2, 5)
+    ]
+    (summary,) = aggregate(items, threshold=0.8, min_success_rate=1.0)
+
+    assert summary.n_attempted == 5, summary
+    assert summary.n_success == 2, summary
+    assert summary.n_error == 3, summary
+    assert abs(summary.success_rate - 0.4) < 1e-9, summary
+    # The two surviving runs are fast, but the config is not dependable.
+    assert summary.p95_window_rtf == 0.5, summary
+    assert summary.meets_realtime_p95 is False, summary
+
+    # Relaxing the floor lets it qualify again -- an explicit, visible choice.
+    (relaxed,) = aggregate(items, threshold=0.8, min_success_rate=0.4)
+    assert relaxed.meets_realtime_p95 is True, relaxed
+
+
+def check_all_error_config_still_reported() -> None:
+    """A config that never succeeded must appear, not silently disappear."""
+    items = [_synth(8, repeat_index=i, status="error", error="boom") for i in range(3)]
+    (summary,) = aggregate(items)
+    assert summary.n_attempted == 3 and summary.n_success == 0, summary
+    assert summary.success_rate == 0.0, summary
+    assert summary.p95_e2e_latency_ms is None, summary
+    assert summary.meets_realtime_p95 is None, summary
+
+
 # --- quality axis (C3) ----------------------------------------------------
 
 
@@ -280,7 +345,7 @@ def check_overlap_scored_once_per_video() -> None:
     items += [_synth(8, video="b.mp4", repeat_index=i, label_word_overlap=False) for i in range(5)]
     (summary,) = aggregate(items)
 
-    assert summary.n_runs == 10, summary  # latency still uses every run
+    assert summary.n_success == 10, summary  # latency still uses every run
     assert summary.n_videos_scored == 2, summary  # quality uses each video once
     assert summary.naive_word_overlap == 0.5, summary
 
@@ -308,7 +373,7 @@ def check_best_config_ignores_overlap() -> None:
     assert pick is not None and pick.num_frames == 16, pick
 
     # Nothing is recommended when no config is fast enough.
-    infeasible = aggregate([_synth(8, rtf_inv=5.0)], threshold=0.8)
+    infeasible = aggregate([_synth(8, window_rtf=5.0)], threshold=0.8)
     assert best_config(infeasible) is None
 
 
@@ -322,6 +387,10 @@ def demo() -> None:
     check_scaling_needs_two_points()
     check_scaling_uses_actual_frames()
     check_aggregate_and_schema()
+    check_window_rtf_is_duration_independent()
+    check_window_rtf_drives_the_verdict()
+    check_failures_are_counted_and_gate_the_verdict()
+    check_all_error_config_still_reported()
     check_overlap_scored_once_per_video()
     check_overlap_is_verbosity_confounded()
     check_best_config_ignores_overlap()

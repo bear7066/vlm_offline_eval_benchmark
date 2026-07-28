@@ -55,8 +55,8 @@ def format_table(summaries: list[ConfigSummary]) -> str:
     """
     header = (
         f"{'model':<18}{'frames':>7}{'tok':>5}{'p50_e2e':>9}{'p95_e2e':>9}"
-        f"{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}{'p95_rtf':>9}"
-        f"{'toks':>7}{'ovlp':>7}{'n':>4}{'RT?':>5}"
+        f"{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}{'p95_wrtf':>10}{'p95_rtf':>9}"
+        f"{'fps':>7}{'toks':>7}{'ovlp':>7}{'n':>4}{'ok':>7}{'RT?':>5}"
     )
     lines = [header, "-" * len(header)]
     for s in sorted(summaries, key=lambda x: (x.model_id, x.num_frames, x.max_new_tokens)):
@@ -69,10 +69,13 @@ def format_table(summaries: list[ConfigSummary]) -> str:
             f"{_fmt(s.max_e2e_latency_ms, '.0f'):>9}"
             f"{_fmt(s.p95_ttft_ms, '.0f'):>10}"
             f"{_fmt(s.mean_tpot_ms, '.1f'):>7}"
-            f"{_fmt(s.p95_rtf_inv):>9}"
+            f"{_fmt(s.p95_window_rtf):>10}"
+            f"{_fmt(s.p95_rtf):>9}"
+            f"{_fmt(s.mean_max_sustainable_fps, '.1f'):>7}"
             f"{_fmt(s.mean_tokens, '.0f'):>7}"
             f"{_fmt(s.naive_word_overlap):>7}"
             f"{s.n_videos_scored:>4}"
+            f"{f'{s.n_success}/{s.n_attempted}':>7}"
             f"{rt:>5}"
         )
     return "\n".join(lines)
@@ -134,35 +137,51 @@ def best_config(summaries: list[ConfigSummary]) -> ConfigSummary | None:
     )
 
 
-def analyze(run_dir: Path, threshold: float = 0.8) -> str:
+def analyze(run_dir: Path, threshold: float = 0.8, min_success_rate: float = 1.0) -> str:
     """Build a human-readable analysis report for a sweep run.
 
     Args:
         run_dir: Sweep run directory.
-        threshold: p95 ``rtf_inv`` cutoff for the real-time decision.
+        threshold: p95 ``window_rtf`` cutoff for the real-time decision.
+        min_success_rate: Run success fraction a config must clear to qualify.
 
     Returns:
-        A report string with the per-config table and the recommended pick.
+        A report string with the per-config table, the frame-scaling fits and
+        the recommended pick.
     """
     results = load_results(run_dir)
-    summaries = aggregate(results, threshold=threshold)
+    summaries = aggregate(results, threshold=threshold, min_success_rate=min_success_rate)
     table = format_table(summaries)
     scaling = format_scaling_table(fit_frame_scaling(results))
+
+    windows = {s.window_sec for s in summaries if s.window_sec is not None}
+    window = f"{windows.pop():g}s" if len(windows) == 1 else "the configured window"
 
     pick = best_config(summaries)
     if pick is None:
         verdict = (
-            f"\nNo config meets p95 rtf_inv <= {threshold}. "
-            "Reduce frames/resolution or consider a faster runtime (vLLM/quantization)."
+            f"\nNo config meets p95 window_rtf <= {threshold} at {window} "
+            f"with success rate >= {min_success_rate:g}. "
+            "Reduce frames/resolution, lengthen the window, or consider a "
+            "faster runtime (vLLM/quantization)."
         )
     else:
         verdict = (
             f"\nRecommended: {model_name_from_id(pick.model_id)} | "
             f"{pick.num_frames} frames | max_new_tokens={pick.max_new_tokens}\n"
-            f"  Most frames among configs meeting p95 rtf_inv <= {threshold} "
-            f"(p95={_fmt(pick.p95_rtf_inv)}, p95 latency="
-            f"{_fmt(pick.p95_e2e_latency_ms, '.0f')} ms).\n"
+            f"  Most frames among configs meeting p95 window_rtf <= {threshold} "
+            f"at {window} (p95={_fmt(pick.p95_window_rtf)}, p95 latency="
+            f"{_fmt(pick.p95_e2e_latency_ms, '.0f')} ms, "
+            f"{pick.n_success}/{pick.n_attempted} runs ok).\n"
             "  Quality is NOT ranked: ovlp is a verbosity-confounded proxy, not "
             "accuracy. Wire up the LLM judge before choosing on quality."
         )
-    return f"{table}\n\nFrame scaling (marginal cost per added frame):\n{scaling}\n{verdict}"
+    legend = (
+        "\nwrtf = window_rtf (latency / deployment stride; the real-time test).  "
+        "rtf = latency / clip duration,\nreference only -- it scales as "
+        "1/duration, so it reflects clip lengths as much as the model."
+    )
+    return (
+        f"{table}\n\nFrame scaling (marginal cost per added frame):\n{scaling}\n"
+        f"{verdict}\n{legend}"
+    )

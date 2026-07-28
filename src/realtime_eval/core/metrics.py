@@ -35,8 +35,20 @@ class RealtimeResult:
         throughput_tps: End-to-end rate, ``tokens / e2e_latency_sec``.
         ttft_source: How ``ttft_ms`` was obtained, so results from different
             backends are never compared blindly.
-        rtf_inv: ``e2e_latency_sec / video_duration_sec``; <= 1.0 is real time.
-        meets_realtime: Whether ``rtf_inv <= 1.0`` for this run.
+        window_sec: Deployment stride this run is judged against -- one
+            inference per ``window_sec`` of incoming video.
+        window_rtf: ``e2e_latency_sec / window_sec``. The real-time criterion:
+            <= 1.0 means the pipeline consumes video at least as fast as it
+            arrives. Independent of clip length.
+        max_sustainable_fps: ``num_frames_actual / e2e_latency_sec`` -- the input
+            frame rate this pipeline can keep up with.
+        rtf: ``e2e_latency_sec / video_duration_sec``, the conventional
+            real-time factor (<= 1.0 is faster than playback). Reported for
+            reference only: frame count is fixed regardless of clip length, so
+            compute per inference is constant while the denominator varies, and
+            this ratio scales as ``1 / duration``. Longer clips pass trivially,
+            which makes it a property of the video set as much as the model.
+            Use ``window_rtf`` to decide.
         video_duration_sec: Source clip duration.
         tokens: Number of generated tokens.
         mean_power_watts: Mean GPU power over the inference.
@@ -66,8 +78,10 @@ class RealtimeResult:
     decode_tps: float | None = None
     throughput_tps: float | None = None
     ttft_source: str | None = None
-    rtf_inv: float | None = None
-    meets_realtime: bool | None = None
+    window_sec: float | None = None
+    window_rtf: float | None = None
+    max_sustainable_fps: float | None = None
+    rtf: float | None = None
     video_duration_sec: float | None = None
     tokens: int | None = None
     mean_power_watts: float | None = None
@@ -282,20 +296,32 @@ def fit_frame_scaling(results: list[RealtimeResult]) -> list[FrameScaling]:
 
 @dataclass
 class ConfigSummary:
-    """Aggregated metrics for one ``(model, frames, tokens)`` config."""
+    """Aggregated metrics for one ``(model, frames, tokens)`` config.
+
+    Timing and quality fields describe the successful runs only;
+    ``n_attempted`` / ``success_rate`` describe how many runs there were, so a
+    config that mostly crashed cannot look like a clean fast one.
+    """
 
     model_id: str
     num_frames: int
     max_new_tokens: int
-    n_runs: int
+    n_attempted: int
+    n_success: int
+    n_error: int
+    success_rate: float
     num_frames_actual: int | None
+    window_sec: float | None
     p50_e2e_latency_ms: float | None
     p95_e2e_latency_ms: float | None
     max_e2e_latency_ms: float | None
     p50_ttft_ms: float | None
     p95_ttft_ms: float | None
-    p50_rtf_inv: float | None
-    p95_rtf_inv: float | None
+    p50_window_rtf: float | None
+    p95_window_rtf: float | None
+    p50_rtf: float | None
+    p95_rtf: float | None
+    mean_max_sustainable_fps: float | None
     mean_preprocess_ms: float | None
     mean_prefill_ms: float | None
     mean_decode_ms: float | None
@@ -323,23 +349,37 @@ def _single(values: list[int]) -> int | None:
     return unique.pop() if len(unique) == 1 else None
 
 
-def aggregate(results: list[RealtimeResult], threshold: float = 0.8) -> list[ConfigSummary]:
+def _single_float(values: list[float]) -> float | None:
+    """The one distinct value, or ``None`` if the runs disagree."""
+    unique = set(values)
+    return unique.pop() if len(unique) == 1 else None
+
+
+def aggregate(
+    results: list[RealtimeResult],
+    threshold: float = 0.8,
+    min_success_rate: float = 1.0,
+) -> list[ConfigSummary]:
     """Collapse per-run results into one summary per config.
 
-    Groups successful results by ``(model_id, num_frames, max_new_tokens)`` and
-    computes latency percentiles, the p95 real-time factor, and accuracy.
+    Groups by ``(model_id, num_frames, max_new_tokens)``. Failed runs are
+    excluded from the metric columns but still counted, so reliability is
+    visible: previously a config where four of five runs crashed reported a
+    single clean run and could be recommended.
 
     Args:
         results: All per-run results from a sweep.
-        threshold: p95 ``rtf_inv`` cutoff used to set ``meets_realtime_p95``.
+        threshold: p95 ``window_rtf`` cutoff for ``meets_realtime_p95``.
+        min_success_rate: Fraction of runs that must succeed for a config to
+            qualify as real time. Defaults to 1.0: a config that intermittently
+            crashes does not meet a real-time guarantee.
 
     Returns:
         One :class:`ConfigSummary` per config, ordered by model then frames.
+        Configs with no successful run are still returned, with ``None`` metrics.
     """
     groups: dict[tuple[str, int, int], list[RealtimeResult]] = {}
     for result in results:
-        if result.status != "success":
-            continue
         key = (result.model_id, result.num_frames, result.max_new_tokens)
         groups.setdefault(key, []).append(result)
 
@@ -347,10 +387,13 @@ def aggregate(results: list[RealtimeResult], threshold: float = 0.8) -> list[Con
         return [v for v in (getattr(r, name) for r in items) if v is not None]
 
     summaries: list[ConfigSummary] = []
-    for (model_id, num_frames, max_new_tokens), items in sorted(groups.items()):
+    for (model_id, num_frames, max_new_tokens), attempted in sorted(groups.items()):
+        items = [r for r in attempted if r.status == "success"]
+        success_rate = len(items) / len(attempted) if attempted else 0.0
         latencies = column(items, "e2e_latency_ms")
         ttfts = column(items, "ttft_ms")
-        rtfs = column(items, "rtf_inv")
+        window_rtfs = column(items, "window_rtf")
+        rtfs = column(items, "rtf")
         # Decoding is greedy, so repeats of a video are byte-identical and add
         # no information. Score each video once, or the denominator is inflated
         # by a factor of `repeats` while the effective sample size is n_videos.
@@ -359,21 +402,33 @@ def aggregate(results: list[RealtimeResult], threshold: float = 0.8) -> list[Con
             for r in items
             if r.repeat_index == 0 and r.label_word_overlap is not None
         ]
-        p95_rtf = percentile(rtfs, 95)
+        p95_window_rtf = percentile(window_rtfs, 95)
+        meets_realtime = (
+            (p95_window_rtf <= threshold and success_rate >= min_success_rate)
+            if p95_window_rtf is not None
+            else None
+        )
         summaries.append(
             ConfigSummary(
                 model_id=model_id,
                 num_frames=num_frames,
                 max_new_tokens=max_new_tokens,
-                n_runs=len(items),
+                n_attempted=len(attempted),
+                n_success=len(items),
+                n_error=len(attempted) - len(items),
+                success_rate=success_rate,
                 num_frames_actual=_single([_frames_of(r) for r in items]),
+                window_sec=_single_float(column(items, "window_sec")),
                 p50_e2e_latency_ms=percentile(latencies, 50),
                 p95_e2e_latency_ms=percentile(latencies, 95),
                 max_e2e_latency_ms=max(latencies) if latencies else None,
                 p50_ttft_ms=percentile(ttfts, 50),
                 p95_ttft_ms=percentile(ttfts, 95),
-                p50_rtf_inv=percentile(rtfs, 50),
-                p95_rtf_inv=p95_rtf,
+                p50_window_rtf=percentile(window_rtfs, 50),
+                p95_window_rtf=p95_window_rtf,
+                p50_rtf=percentile(rtfs, 50),
+                p95_rtf=percentile(rtfs, 95),
+                mean_max_sustainable_fps=_mean(column(items, "max_sustainable_fps")),
                 mean_preprocess_ms=_mean(column(items, "preprocess_ms")),
                 mean_prefill_ms=_mean(column(items, "prefill_ms")),
                 mean_decode_ms=_mean(column(items, "decode_ms")),
@@ -384,7 +439,7 @@ def aggregate(results: list[RealtimeResult], threshold: float = 0.8) -> list[Con
                 mean_power_watts=_mean(column(items, "mean_power_watts")),
                 n_videos_scored=len(scored),
                 naive_word_overlap=(sum(scored) / len(scored)) if scored else None,
-                meets_realtime_p95=(p95_rtf <= threshold) if p95_rtf is not None else None,
+                meets_realtime_p95=meets_realtime,
             )
         )
     return summaries

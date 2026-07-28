@@ -93,6 +93,7 @@ def run_config(
     prompt: str,
     repeats: int,
     warmup: int,
+    window_sec: float = 1.0,
     power_interval_sec: float = 0.1,
 ) -> list[RealtimeResult]:
     """Benchmark one ``(num_frames, max_new_tokens)`` config over a video set.
@@ -110,6 +111,7 @@ def run_config(
         prompt: Instruction text sent with the frames.
         repeats: Timed iterations per video for percentile estimation.
         warmup: Discarded iterations before timing.
+        window_sec: Deployment stride the real-time verdict is judged against.
         power_interval_sec: Background power sampling period.
 
     Returns:
@@ -161,11 +163,12 @@ def run_config(
             decode_ms = generated.get("decode_ms")
             if decode_ms is None and latency_ms is not None and ttft_ms is not None:
                 decode_ms = latency_ms - ttft_ms
-            rtf_inv = (
-                (generated["elapsed_sec"] / duration_sec)
-                if duration_sec and duration_sec > 0
-                else None
+            elapsed_sec = generated["elapsed_sec"]
+            rtf = (
+                (elapsed_sec / duration_sec) if duration_sec and duration_sec > 0 else None
             )
+            window_rtf = (elapsed_sec / window_sec) if window_sec > 0 else None
+            sustainable_fps = (len(frames) / elapsed_sec) if elapsed_sec > 0 else None
             response = generated["response"]
             results.append(
                 RealtimeResult(
@@ -185,8 +188,10 @@ def run_config(
                     decode_tps=generated.get("decode_tps"),
                     throughput_tps=generated["throughput_tps"],
                     ttft_source=generated.get("ttft_source"),
-                    rtf_inv=rtf_inv,
-                    meets_realtime=(rtf_inv <= 1.0 if rtf_inv is not None else None),
+                    window_sec=window_sec,
+                    window_rtf=window_rtf,
+                    max_sustainable_fps=sustainable_fps,
+                    rtf=rtf,
                     video_duration_sec=duration_sec,
                     tokens=generated["tokens"],
                     mean_power_watts=mean_w,

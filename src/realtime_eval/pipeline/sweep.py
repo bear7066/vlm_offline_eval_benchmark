@@ -30,6 +30,7 @@ def run_single(
     repeats: int = 1,
     warmup: int = 1,
     label: str | None = None,
+    window_sec: float = 1.0,
     power_interval_sec: float = 0.1,
 ) -> list[RealtimeResult]:
     """Run one model on one video for quick verification.
@@ -48,6 +49,7 @@ def run_single(
         warmup: Discarded iterations before timing.
         label: Ground-truth label override; defaults to the file's parent
             directory name (the project convention).
+        window_sec: Deployment stride the real-time verdict is judged against.
         power_interval_sec: Background power sampling period.
 
     Returns:
@@ -80,6 +82,7 @@ def run_single(
         prompt=prompt,
         repeats=repeats,
         warmup=warmup,
+        window_sec=window_sec,
         power_interval_sec=power_interval_sec,
     )
 
@@ -146,7 +149,9 @@ def run_sweep(
             "max_new_tokens_grid": list(config.max_new_tokens_grid),
             "repeats": config.repeats,
             "warmup": config.warmup,
+            "window_sec": config.window_sec,
             "realtime_threshold": config.realtime_threshold,
+            "min_success_rate": config.min_success_rate,
             "prompt": config.prompt,
         },
     )
@@ -182,6 +187,7 @@ def run_sweep(
                     prompt=config.prompt,
                     repeats=config.repeats,
                     warmup=config.warmup,
+                    window_sec=config.window_sec,
                     power_interval_sec=config.power_sample_interval_sec,
                 )
                 for result in results:
@@ -199,12 +205,18 @@ def run_sweep(
         except Exception:
             pass
 
-    summaries = aggregate(all_results, threshold=config.realtime_threshold)
+    summaries = aggregate(
+        all_results,
+        threshold=config.realtime_threshold,
+        min_success_rate=config.min_success_rate,
+    )
     _write_json(
         run_dir / "summary.json",
         {
             "hardware_name": hardware_name,
+            "window_sec": config.window_sec,
             "realtime_threshold": config.realtime_threshold,
+            "min_success_rate": config.min_success_rate,
             "configs": [s.to_dict() for s in summaries],
         },
     )
