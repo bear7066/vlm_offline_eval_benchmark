@@ -7,6 +7,7 @@ the streamer and a stub model directly.
 """
 from __future__ import annotations
 
+import math
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ from realtime_eval.core.power import DeviceSampler
 from realtime_eval.pipeline.analyze import best_config
 from vlm_eval.hardware import get_gpu_power_watts
 from vlm_eval.inference.gemma import HuggingFaceVLM, _first_token_streamer_cls
+from vlm_eval.video import frame_span, sample_frames
 
 # Deliberately word-shaped: the first token has no trailing space, which is
 # exactly the case the old TTFT measurement got wrong.
@@ -422,6 +424,81 @@ def check_best_config_ranks_on_frames() -> None:
     assert best_config(infeasible) is None
 
 
+# --- windowed sampling -----------------------------------------------------
+
+
+def check_frame_span_is_half_open() -> None:
+    """Consecutive windows must tile the clip without sharing a frame."""
+    fps, total = 30.0, 120  # 4.0 s
+
+    # 1 s windows divide evenly: 30 frames each, contiguous, no overlap.
+    spans = [frame_span(k * 1.0, (k + 1) * 1.0, fps, total) for k in range(4)]
+    assert spans == [(0, 29), (30, 59), (60, 89), (90, 119)], spans
+    for (_, prev_last), (next_first, _) in zip(spans, spans[1:]):
+        assert next_first == prev_last + 1, (prev_last, next_first)
+
+    # The whole-clip span must match the pre-window behaviour exactly.
+    assert frame_span(0.0, total / fps, fps, total) == (0, total - 1)
+
+    # 0.25 s at 30 fps is 7.5 frames, so availability alternates 8/7. The
+    # validation rule uses floor() = 7, the minimum any window can supply.
+    counts = [
+        last - first + 1
+        for first, last in (
+            frame_span(k * 0.25, (k + 1) * 0.25, fps, total) for k in range(4)
+        )
+    ]
+    assert counts == [8, 7, 8, 7], counts
+    assert min(counts) == math.floor(0.25 * fps) == 7, counts
+
+    # An interval falling between two frame times yields an empty span.
+    first, last = frame_span(0.001, 0.002, fps, total)
+    assert last < first, (first, last)
+
+
+def check_windowed_sampling_on_real_video() -> None:
+    """Sampled timestamps must land inside the requested window."""
+    video = Path(__file__).resolve().parents[1] / "video.mp4"
+    if not video.exists():
+        print("  (skipped windowed video check: video.mp4 absent)")
+        return
+
+    whole, duration, total, fps = sample_frames(video, num_frames=8)
+    assert whole is not None and len(whole) == 8
+    assert abs(duration - 4.0) < 0.05, duration
+
+    # window_sec == clip duration must reproduce whole-clip sampling exactly.
+    same, _, _, _ = sample_frames(video, num_frames=8, start_sec=0.0, end_sec=duration)
+    assert same is not None and len(same) == len(whole)
+    assert [f.tobytes() for f in same] == [f.tobytes() for f in whole], (
+        "window == whole clip must be byte-identical to unwindowed sampling"
+    )
+
+    # Four 1 s windows: 8 frames each, all timestamps inside their window.
+    for k in range(4):
+        start, end = k * 1.0, (k + 1) * 1.0
+        frames, _, _, _ = sample_frames(video, num_frames=8, start_sec=start, end_sec=end)
+        assert frames is not None and len(frames) == 8, (k, frames)
+        first, last = frame_span(start, end, fps, total)
+        assert start <= first / fps and (last + 1) / fps <= end + 1e-9, (k, first, last)
+
+    # Windows carrying different content must differ from each other.
+    w0, _, _, _ = sample_frames(video, num_frames=8, start_sec=0.0, end_sec=1.0)
+    w3, _, _, _ = sample_frames(video, num_frames=8, start_sec=3.0, end_sec=4.0)
+    assert w0[0].tobytes() != w3[0].tobytes(), "windows should show different frames"
+
+
+def check_empty_window_returns_none() -> None:
+    """A degenerate or out-of-range window must fail cleanly, not crash."""
+    video = Path(__file__).resolve().parents[1] / "video.mp4"
+    if not video.exists():
+        print("  (skipped empty-window check: video.mp4 absent)")
+        return
+    for start, end in ((1.0, 1.0), (2.0, 1.0), (99.0, 100.0)):
+        frames, _, _, _ = sample_frames(video, num_frames=8, start_sec=start, end_sec=end)
+        assert frames is None, (start, end, frames)
+
+
 def demo() -> None:
     check_first_token_timestamp()
     check_phase_split()
@@ -442,6 +519,9 @@ def demo() -> None:
     check_vram_reports_both_views()
     check_power_reading_is_cheap()
     check_best_config_ranks_on_frames()
+    check_frame_span_is_half_open()
+    check_windowed_sampling_on_real_video()
+    check_empty_window_returns_none()
     print("ok")
 
 
