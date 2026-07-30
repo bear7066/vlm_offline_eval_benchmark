@@ -15,8 +15,8 @@ from vlm_eval.paths import model_name_from_id, slugify
 
 from realtime_eval.core.config import SweepConfig
 from realtime_eval.core.dataset import discover_videos
-from realtime_eval.core.metrics import RealtimeResult, aggregate
-from realtime_eval.pipeline.runner import load_model, run_config
+from realtime_eval.core.metrics import SCHEMA_VERSION, RealtimeResult, aggregate
+from realtime_eval.pipeline.runner import build_window_cache, load_model, run_config
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +30,14 @@ def run_single(
     repeats: int = 1,
     warmup: int = 1,
     label: str | None = None,
+    window_sec: float = 1.0,
     power_interval_sec: float = 0.1,
 ) -> list[RealtimeResult]:
     """Run one model on one video for quick verification.
 
-    Loads the model, samples ``num_frames``, runs ``warmup`` discarded
-    iterations, then ``repeats`` timed iterations. Nothing is written to disk;
+    Loads the model, tiles the clip into ``window_sec`` windows, samples
+    ``num_frames`` from each, runs ``warmup`` discarded iterations, then
+    ``repeats`` timed iterations per window. Nothing is written to disk;
     results are returned for the caller to display.
 
     Args:
@@ -48,10 +50,12 @@ def run_single(
         warmup: Discarded iterations before timing.
         label: Ground-truth label override; defaults to the file's parent
             directory name (the project convention).
+        window_sec: Window length; frames span exactly this much video, and it
+            is the denominator of ``window_rtf``.
         power_interval_sec: Background power sampling period.
 
     Returns:
-        One :class:`RealtimeResult` per timed repeat.
+        One :class:`RealtimeResult` per ``(window, repeat)``.
     """
     load_dotenv()
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -80,6 +84,7 @@ def run_single(
         prompt=prompt,
         repeats=repeats,
         warmup=warmup,
+        window_sec=window_sec,
         power_interval_sec=power_interval_sec,
     )
 
@@ -137,6 +142,7 @@ def run_sweep(
     _write_json(
         run_dir / "config.json",
         {
+            "schema_version": SCHEMA_VERSION,
             "videos_root": str(videos_root),
             "num_videos": len(videos),
             "hardware_name": hardware_name,
@@ -146,12 +152,18 @@ def run_sweep(
             "max_new_tokens_grid": list(config.max_new_tokens_grid),
             "repeats": config.repeats,
             "warmup": config.warmup,
+            "window_sec": config.window_sec,
             "realtime_threshold": config.realtime_threshold,
+            "min_success_rate": config.min_success_rate,
             "prompt": config.prompt,
         },
     )
 
     results_path = run_dir / "results.jsonl"
+    # Create it up front so the run dir is well-formed even when every model
+    # fails to load; otherwise analyze() reports a missing file rather than the
+    # real problem.
+    results_path.touch()
     logger.info("Sweep run dir: %s", run_dir)
     logger.info("Hardware: %s | videos: %d", hardware_name, len(videos))
 
@@ -166,6 +178,15 @@ def run_sweep(
             continue
 
         for num_frames in config.num_frames_grid:
+            # Decode once per frame count, not once per (frames, tokens) pair.
+            frame_cache = build_window_cache(videos, num_frames, config.window_sec)
+            logger.info(
+                "Sampled %d window(s) of %gs at %d frames (%.1f fps density)",
+                len(frame_cache),
+                config.window_sec,
+                num_frames,
+                num_frames / config.window_sec,
+            )
             for max_new_tokens in config.max_new_tokens_grid:
                 logger.info(
                     "Config: %s | frames=%d | max_new_tokens=%d",
@@ -182,7 +203,9 @@ def run_sweep(
                     prompt=config.prompt,
                     repeats=config.repeats,
                     warmup=config.warmup,
+                    window_sec=config.window_sec,
                     power_interval_sec=config.power_sample_interval_sec,
+                    cache=frame_cache,
                 )
                 for result in results:
                     _append_jsonl(results_path, result.to_dict())
@@ -199,14 +222,27 @@ def run_sweep(
         except Exception:
             pass
 
-    summaries = aggregate(all_results, threshold=config.realtime_threshold)
+    summaries = aggregate(
+        all_results,
+        threshold=config.realtime_threshold,
+        min_success_rate=config.min_success_rate,
+    )
     _write_json(
         run_dir / "summary.json",
         {
+            "schema_version": SCHEMA_VERSION,
             "hardware_name": hardware_name,
+            "window_sec": config.window_sec,
             "realtime_threshold": config.realtime_threshold,
+            "min_success_rate": config.min_success_rate,
             "configs": [s.to_dict() for s in summaries],
         },
     )
+    if not all_results:
+        logger.error(
+            "Sweep produced no results: every model failed to load, or no video "
+            "yielded a usable %gs window.",
+            config.window_sec,
+        )
     logger.info("Wrote %d results to %s", len(all_results), results_path)
     return run_dir

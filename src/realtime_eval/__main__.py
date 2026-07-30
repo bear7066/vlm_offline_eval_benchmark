@@ -31,8 +31,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Run the sweep described by a JSON config. The file fully specifies "
             "the run: a required 'videos' path, an optional 'limit', and any "
             "SweepConfig field (model_ids, num_frames_grid, max_new_tokens_grid, "
-            "repeats, warmup, output_root, prompt, realtime_threshold, "
-            "power_sample_interval_sec). Omitted fields keep their defaults."
+            "repeats, warmup, output_root, prompt, window_sec, "
+            "realtime_threshold, min_success_rate, power_sample_interval_sec). "
+            "Omitted fields keep their defaults. Note window_sec sets both the "
+            "span frames are sampled from and the real-time denominator."
         ),
     )
     sweep.add_argument("config", type=Path, help="Path to a JSON sweep config file.")
@@ -68,12 +70,30 @@ def _build_parser() -> argparse.ArgumentParser:
     single.add_argument("--warmup", type=int, default=1, help="Warmup iterations (default 1).")
     single.add_argument("--label", "-l", type=str, default=None, help="Ground-truth label override.")
     single.add_argument(
+        "--window_sec",
+        type=float,
+        default=1.0,
+        help=(
+            "Window length in seconds (default 1.0). Sets both the span frames "
+            "are sampled from and the denominator of window_rtf; the clip is "
+            "tiled into windows and each is timed separately."
+        ),
+    )
+    single.add_argument(
         "--prompt", "-p", type=str, default=DEFAULT_REALTIME_PROMPT, help="Prompt text."
     )
 
     an = sub.add_parser("analyze", help="Summarize a completed sweep run.")
     an.add_argument("run_dir", type=Path, help="Sweep run directory containing results.jsonl.")
-    an.add_argument("--threshold", type=float, default=0.8, help="p95 rtf_inv cutoff (default 0.8).")
+    an.add_argument(
+        "--threshold", type=float, default=0.8, help="p95 window_rtf cutoff (default 0.8)."
+    )
+    an.add_argument(
+        "--min_success_rate",
+        type=float,
+        default=1.0,
+        help="Run success fraction required to qualify as real time (default 1.0).",
+    )
 
     config = sub.add_parser("config", help="Manage sweep config files.")
     config_sub = config.add_subparsers(dest="config_command", required=True)
@@ -145,6 +165,27 @@ def _load_sweep_config(path: Path) -> tuple[Path, SweepConfig, int | None]:
     return videos, SweepConfig.from_dict(data), limit
 
 
+def _report(run_dir: Path, config: SweepConfig) -> int:
+    """Print a sweep's analysis and return the process exit code.
+
+    Args:
+        run_dir: Directory the sweep wrote.
+        config: The config it ran with, for the threshold settings.
+
+    Returns:
+        0 normally, 1 if the sweep produced no results at all -- so a run where
+        every model failed to load does not exit successfully.
+    """
+    print(
+        analyze(
+            run_dir,
+            threshold=config.realtime_threshold,
+            min_success_rate=config.min_success_rate,
+        )
+    )
+    return 0 if (run_dir / "results.jsonl").stat().st_size > 0 else 1
+
+
 def _print_single(results: list[RealtimeResult]) -> None:
     """Print each timed run from a ``single`` invocation as JSON.
 
@@ -177,16 +218,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sweep":
         videos, config, limit = _load_sweep_config(args.config)
         run_dir = run_sweep(videos, config, video_limit=limit)
-        print(analyze(run_dir, threshold=config.realtime_threshold))
-        return 0
+        return _report(run_dir, config)
 
     if args.command == "sweep-vllm":
         from realtime_eval.pipeline.sweep_vllm import run_sweep_vllm
 
         videos, config, limit = _load_sweep_config(args.config)
         run_dir = run_sweep_vllm(videos, config, video_limit=limit)
-        print(analyze(run_dir, threshold=config.realtime_threshold))
-        return 0
+        return _report(run_dir, config)
 
     if args.command == "single":
         results = run_single(
@@ -198,12 +237,19 @@ def main(argv: list[str] | None = None) -> int:
             repeats=args.repeats,
             warmup=args.warmup,
             label=args.label,
+            window_sec=args.window_sec,
         )
         _print_single(results)
         return 0
 
     if args.command == "analyze":
-        print(analyze(args.run_dir, threshold=args.threshold))
+        print(
+            analyze(
+                args.run_dir,
+                threshold=args.threshold,
+                min_success_rate=args.min_success_rate,
+            )
+        )
         return 0
 
     return 1

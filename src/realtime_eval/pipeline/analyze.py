@@ -5,7 +5,14 @@ from pathlib import Path
 
 from vlm_eval.paths import model_name_from_id
 
-from realtime_eval.core.metrics import ConfigSummary, RealtimeResult, aggregate
+from realtime_eval.core.metrics import (
+    ConfigSummary,
+    FrameScaling,
+    RealtimeResult,
+    aggregate,
+    fit_frame_scaling,
+    result_from_dict,
+)
 
 
 def load_results(run_dir: Path) -> list[RealtimeResult]:
@@ -29,7 +36,7 @@ def load_results(run_dir: Path) -> list[RealtimeResult]:
         for line in f:
             line = line.strip()
             if line:
-                results.append(RealtimeResult(**json.loads(line)))
+                results.append(result_from_dict(json.loads(line)))
     return results
 
 
@@ -47,31 +54,73 @@ def format_table(summaries: list[ConfigSummary]) -> str:
         A multi-line string sorted by model, then frame count.
     """
     header = (
-        f"{'model':<18}{'frames':>7}{'tok':>5}{'p50_lat_ms':>12}"
-        f"{'p95_lat_ms':>12}{'p95_rtf':>9}{'ms/frame':>10}{'acc':>7}{'RT?':>5}"
+        f"{'model':<18}{'frames':>7}{'tok':>5}{'win':>5}{'dens':>6}"
+        f"{'p50_e2e':>9}{'p95_e2e':>9}{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}"
+        f"{'p95_wrtf':>10}{'sust':>7}{'toks':>7}{'J':>8}{'W':>7}{'vramGB':>8}"
+        f"{'ok':>7}{'RT?':>5}"
     )
     lines = [header, "-" * len(header)]
     for s in sorted(summaries, key=lambda x: (x.model_id, x.num_frames, x.max_new_tokens)):
         rt = "yes" if s.meets_realtime_p95 else "no"
         lines.append(
             f"{model_name_from_id(s.model_id):<18}"
-            f"{s.num_frames:>7}{s.max_new_tokens:>5}"
-            f"{_fmt(s.p50_latency_ms, '.0f'):>12}"
-            f"{_fmt(s.p95_latency_ms, '.0f'):>12}"
-            f"{_fmt(s.p95_rtf_inv):>9}"
-            f"{_fmt(s.mean_prefill_ms_per_frame, '.0f'):>10}"
-            f"{_fmt(s.accuracy):>7}"
+            f"{s.num_frames:>7}{s.max_new_tokens:>5}{s.n_windows:>5}"
+            f"{_fmt(s.num_frames / s.window_sec if s.window_sec else None, '.1f'):>6}"
+            f"{_fmt(s.p50_e2e_latency_ms, '.0f'):>9}"
+            f"{_fmt(s.p95_e2e_latency_ms, '.0f'):>9}"
+            f"{_fmt(s.max_e2e_latency_ms, '.0f'):>9}"
+            f"{_fmt(s.p95_ttft_ms, '.0f'):>10}"
+            f"{_fmt(s.mean_tpot_ms, '.1f'):>7}"
+            f"{_fmt(s.p95_window_rtf):>10}"
+            f"{_fmt(s.mean_max_sustainable_fps, '.1f'):>7}"
+            f"{_fmt(s.mean_tokens, '.0f'):>7}"
+            f"{_fmt(s.mean_energy_j, '.1f'):>8}"
+            f"{_fmt(s.mean_power_watts, '.0f'):>7}"
+            f"{_fmt(s.max_peak_vram_device_gb, '.2f'):>8}"
+            f"{f'{s.n_success}/{s.n_attempted}':>7}"
             f"{rt:>5}"
         )
     return "\n".join(lines)
 
 
-def best_config(summaries: list[ConfigSummary]) -> ConfigSummary | None:
-    """Pick the highest-accuracy config that meets the real-time threshold.
+def format_scaling_table(fits: list[FrameScaling]) -> str:
+    """Render frame-scaling fits as a fixed-width text table.
 
-    Among configs with ``meets_realtime_p95`` True, returns the one with the
-    highest accuracy, breaking ties toward more frames (more capacity) then
-    lower p95 latency.
+    Args:
+        fits: Per-``(model, tokens)`` frame-scaling fits.
+
+    Returns:
+        A multi-line string. ``R2`` is only meaningful at ``pts >= 3``; with two
+        points the fit is exact by construction.
+    """
+    header = (
+        f"{'model':<18}{'tok':>5}{'pts':>5}{'ttft_ms/frame':>15}{'ttft_fix_ms':>13}"
+        f"{'R2':>7}{'pref_ms/frame':>15}{'pref_fix_ms':>13}{'R2':>7}"
+    )
+    lines = [header, "-" * len(header)]
+    for f in fits:
+        lines.append(
+            f"{model_name_from_id(f.model_id):<18}"
+            f"{f.max_new_tokens:>5}{f.n_points:>5}"
+            f"{_fmt(f.ttft_ms_per_frame, '.1f'):>15}"
+            f"{_fmt(f.ttft_fixed_ms, '.0f'):>13}"
+            f"{_fmt(f.ttft_fit_r2, '.3f'):>7}"
+            f"{_fmt(f.prefill_ms_per_frame, '.1f'):>15}"
+            f"{_fmt(f.prefill_fixed_ms, '.0f'):>13}"
+            f"{_fmt(f.prefill_fit_r2, '.3f'):>7}"
+        )
+    return "\n".join(lines)
+
+
+def best_config(summaries: list[ConfigSummary]) -> ConfigSummary | None:
+    """Pick the most capable config that still meets the real-time threshold.
+
+    Ranks on frame count -- the most temporal evidence the model gets per
+    inference -- breaking ties toward lower p95 latency.
+
+    Performance only: response quality is out of scope for this benchmark and is
+    scored by ``intelligence_eval``, so the pick here is the most capable config
+    that is fast enough, not the most accurate one.
 
     Args:
         summaries: Aggregated config summaries.
@@ -84,39 +133,77 @@ def best_config(summaries: list[ConfigSummary]) -> ConfigSummary | None:
         return None
     return max(
         realtime,
-        key=lambda s: (
-            s.accuracy if s.accuracy is not None else -1.0,
-            s.num_frames,
-            -(s.p95_latency_ms or 0.0),
-        ),
+        key=lambda s: (s.num_frames, -(s.p95_e2e_latency_ms or 0.0)),
     )
 
 
-def analyze(run_dir: Path, threshold: float = 0.8) -> str:
+def analyze(run_dir: Path, threshold: float = 0.8, min_success_rate: float = 1.0) -> str:
     """Build a human-readable analysis report for a sweep run.
 
     Args:
         run_dir: Sweep run directory.
-        threshold: p95 ``rtf_inv`` cutoff for the real-time decision.
+        threshold: p95 ``window_rtf`` cutoff for the real-time decision.
+        min_success_rate: Run success fraction a config must clear to qualify.
 
     Returns:
-        A report string with the per-config table and the recommended pick.
+        A report string with the per-config table, the frame-scaling fits and
+        the recommended pick.
     """
     results = load_results(run_dir)
-    summaries = aggregate(results, threshold=threshold)
+    if not results:
+        return (
+            f"No results in {run_dir}. The sweep produced nothing -- check the "
+            "log for models that failed to load or videos with no usable window."
+        )
+    summaries = aggregate(results, threshold=threshold, min_success_rate=min_success_rate)
     table = format_table(summaries)
+    scaling = format_scaling_table(fit_frame_scaling(results))
+
+    thin = [s for s in summaries if 0 < s.n_success < 20]
+    caveat = (
+        f"\nNote: {len(thin)} config(s) have fewer than 20 successful runs, so "
+        "their p95 is\neffectively the max -- compare it against the max_e2e "
+        "column rather than reading it as a percentile."
+        if thin
+        else ""
+    )
+
+    windows = {s.window_sec for s in summaries if s.window_sec is not None}
+    window = f"{windows.pop():g}s" if len(windows) == 1 else "the configured window"
 
     pick = best_config(summaries)
     if pick is None:
         verdict = (
-            f"\nNo config meets p95 rtf_inv <= {threshold}. "
-            "Reduce frames/resolution or consider a faster runtime (vLLM/quantization)."
+            f"\nNo config meets p95 window_rtf <= {threshold} at {window} "
+            f"with success rate >= {min_success_rate:g}. "
+            "Reduce frames/resolution, lengthen the window, or consider a "
+            "faster runtime (vLLM/quantization)."
         )
     else:
         verdict = (
             f"\nRecommended: {model_name_from_id(pick.model_id)} | "
             f"{pick.num_frames} frames | max_new_tokens={pick.max_new_tokens}\n"
-            f"  p95 rtf_inv={_fmt(pick.p95_rtf_inv)} (<= {threshold}), "
-            f"accuracy={_fmt(pick.accuracy)}, p95 latency={_fmt(pick.p95_latency_ms, '.0f')} ms"
+            f"  Most frames among configs meeting p95 window_rtf <= {threshold} "
+            f"at {window} (p95={_fmt(pick.p95_window_rtf)}, p95 latency="
+            f"{_fmt(pick.p95_e2e_latency_ms, '.0f')} ms, "
+            f"{pick.n_success}/{pick.n_attempted} runs ok).\n"
+            "  Performance only -- response quality is scored by "
+            "intelligence_eval, not this benchmark."
         )
-    return f"{table}\n{verdict}"
+    legend = (
+        "\nwin = distinct windows sampled (x repeats = ok runs); dens = input "
+        "frames/sec fed to the\nmodel (num_frames / window_sec); sust = "
+        "max_sustainable_fps, the rate the pipeline keeps up\nwith -- real time "
+        "means sust >= dens, equivalently wrtf <= 1.\n"
+        "wrtf = window_rtf = latency / window_sec, the real-time test. rtf "
+        "(latency / whole-clip\nduration) is in summary.json but not shown: it "
+        "compares one window's latency against a\nclip of many windows, so it "
+        "scales as 1/duration and says more about clip lengths.\n"
+        "J = energy per inference, W = time-weighted board power, vramGB = peak "
+        "device-wide VRAM\n(includes CUDA context). Power is whole-board: only "
+        "meaningful on an otherwise idle GPU."
+    )
+    return (
+        f"{table}\n\nFrame scaling (marginal cost per added frame):\n{scaling}\n"
+        f"{verdict}\n{legend}{caveat}"
+    )
