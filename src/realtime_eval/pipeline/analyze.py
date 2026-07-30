@@ -150,6 +150,11 @@ def analyze(run_dir: Path, threshold: float = 0.8, min_success_rate: float = 1.0
         the recommended pick.
     """
     results = load_results(run_dir)
+    if not results:
+        return (
+            f"No results in {run_dir}. The sweep produced nothing -- check the "
+            "log for models that failed to load or videos with no usable window."
+        )
     summaries = aggregate(results, threshold=threshold, min_success_rate=min_success_rate)
     table = format_table(summaries)
     scaling = format_scaling_table(fit_frame_scaling(results))

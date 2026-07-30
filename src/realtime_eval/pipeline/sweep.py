@@ -160,6 +160,10 @@ def run_sweep(
     )
 
     results_path = run_dir / "results.jsonl"
+    # Create it up front so the run dir is well-formed even when every model
+    # fails to load; otherwise analyze() reports a missing file rather than the
+    # real problem.
+    results_path.touch()
     logger.info("Sweep run dir: %s", run_dir)
     logger.info("Hardware: %s | videos: %d", hardware_name, len(videos))
 
@@ -234,5 +238,11 @@ def run_sweep(
             "configs": [s.to_dict() for s in summaries],
         },
     )
+    if not all_results:
+        logger.error(
+            "Sweep produced no results: every model failed to load, or no video "
+            "yielded a usable %gs window.",
+            config.window_sec,
+        )
     logger.info("Wrote %d results to %s", len(all_results), results_path)
     return run_dir
