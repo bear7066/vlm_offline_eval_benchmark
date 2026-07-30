@@ -4,16 +4,63 @@ Every metric emitted by `realtime_eval`, with its exact formula. Defined in
 `core/metrics.py`; produced by `pipeline/runner.py`; rendered by
 `pipeline/analyze.py`.
 
-**Schema version 2.** Recorded in each run's `config.json` and `summary.json`.
+**Schema version 3.** Recorded in each run's `config.json` and `summary.json`.
 Results from different schema versions are not comparable, and
 `result_from_dict` rejects records carrying fields from another version rather
 than reinterpreting them.
 
 ---
 
+## 0. Sampling strategy
+
+The **window is the unit of evaluation.** Each clip is tiled into
+non-overlapping windows of `window_sec`, and every window is one benchmark
+sample: `num_frames` are drawn evenly from that window alone, never across the
+whole clip.
+
+```
+video.mp4 (4.0 s, 120 frames @ 30 fps), window_sec=1.0, num_frames=8
+
+  window 0: t ∈ [0.0, 1.0)  frames [0,29]    → 8 sampled, 8 fps density
+  window 1: t ∈ [1.0, 2.0)  frames [30,59]   → 8 sampled
+  window 2: t ∈ [2.0, 3.0)  frames [60,89]   → 8 sampled
+  window 3: t ∈ [3.0, 4.0)  frames [90,119]  → 8 sampled
+```
+
+This matters because `window_rtf` compares a latency against `window_sec`.
+Sampling across the whole clip would show the model a different temporal
+density (1.8 fps here) than the stride it is judged against.
+
+**Input density** is `num_frames / window_sec` — the frame rate actually fed to
+the model. It is a choice, not a by-product of clip length.
+
+Rules:
+
+- Windows are **half-open** `[start, start + window_sec)`, so consecutive
+  windows tile a clip without sharing a frame.
+- **Partial tail windows are dropped.** A 4.0 s clip at `window_sec=1.5` yields
+  windows at 0.0 and 1.5; the 1.0 s remainder is discarded, because a shorter
+  window carries a different frame density and would contaminate the aggregate.
+- **Clips shorter than one window are skipped**, logged by name.
+- **`num_frames ≤ floor(window_sec × fps)` is enforced per clip**, before any
+  inference. The floor is used because a non-integer frame count per window
+  alternates — 0.25 s at 30 fps gives 7.5, so windows supply 8, 7, 8, 7 — and
+  the floor is the fewest any window can supply. Allowing it through would make
+  `num_frames_actual` vary between windows, which collapses
+  `ConfigSummary.num_frames_actual` to `None` and leaves `fit_frame_scaling`
+  fitting a slope over a one-frame lever arm. The error names every offending
+  clip and the `window_sec` that would fix it.
+- `window_sec == clip duration` yields exactly one whole-clip window and
+  reproduces the pre-windowing behaviour bit-for-bit.
+
+Frame decoding happens outside the timed region, so none of this affects
+latency measurement.
+
+---
+
 ## 1. Per-run metrics — `RealtimeResult`
 
-One record per `(video, repeat)`. 32 fields.
+One record per `(window, repeat)`. 34 fields.
 
 ### 1.1 Identity and configuration
 
@@ -23,9 +70,11 @@ One record per `(video, repeat)`. 32 fields.
 | `label` | Ground-truth action label | — |
 | `model_id` | HuggingFace model ID | — |
 | `num_frames` | Frames **requested** for this config | frames |
-| `num_frames_actual` | Frames **actually fed** to the model. Lower than `num_frames` for clips with fewer frames than requested, because duplicate sample indices are dropped. Denominator of every per-frame quantity | frames |
+| `num_frames_actual` | Frames **actually fed** to the model. Normally equals `num_frames`, since a window that cannot supply them is rejected up front (§0). Denominator of every per-frame quantity | frames |
 | `max_new_tokens` | Generation cap | tokens |
 | `repeat_index` | Zero-based index of the timed repeat | — |
+| `window_index` | Zero-based window position within the clip | — |
+| `window_start_sec` | Window start offset in the clip | s |
 
 ### 1.2 Latency phases
 
@@ -76,11 +125,11 @@ is folded into the number.
 
 | Field | Definition | Unit |
 |---|---|---|
-| `window_sec` | The deployment contract: one inference per `window_sec` of incoming video, sampling `num_frames` from that window. Set it to the stride the system will really run at | s |
+| `window_sec` | The window this run covers. Sets **both** the span the frames were drawn from (§0) and the denominator below, so it is the single source of truth for the deployment contract. Set it to the stride the system will really run at | s |
 | **`window_rtf`** | **`e2e_latency_sec / window_sec`.** The real-time test: ≤ 1.0 means the pipeline consumes video at least as fast as it arrives. Independent of clip length | ratio |
 | `max_sustainable_fps` | `num_frames_actual / e2e_latency_sec` — the input frame rate this pipeline can keep up with | frames/s |
-| `rtf` | `e2e_latency_sec / video_duration_sec`, the conventional real-time factor (≤ 1.0 is faster than playback). **Reference only.** Frame count is fixed regardless of clip length, so compute per inference is constant while the denominator varies: the ratio scales as `1 / duration` and longer clips pass trivially. It describes the video set as much as the model — decide on `window_rtf` | ratio |
-| `video_duration_sec` | Clip duration, `total_frames / fps` | s |
+| `rtf` | `e2e_latency_sec / video_duration_sec`, against the **whole clip**. **Reference only**, and actively misleading under windowed sampling: it compares one window's latency against a clip spanning many windows, so it scales as `1 / duration` and longer clips pass trivially. Kept in `results.jsonl` / `summary.json` but omitted from the report table. Decide on `window_rtf` | ratio |
+| `video_duration_sec` | **Whole clip** duration, `total_frames / fps` — not the window length | s |
 
 ### 1.6 Power and energy
 
@@ -118,7 +167,7 @@ Both views are reported because they answer different questions.
 
 ## 2. Per-config metrics — `ConfigSummary`
 
-One record per `(model_id, num_frames, max_new_tokens)`. 30 fields. Metric
+One record per `(model_id, num_frames, max_new_tokens)`. 31 fields. Metric
 columns describe the **successful** runs; the counts in §2.1 describe every
 attempt. This benchmark measures performance only — no quality metric is
 reported, since `intelligence_eval` covers that axis.
@@ -144,8 +193,9 @@ than disappearing from the report.
 | Field | Definition |
 |---|---|
 | `model_id`, `num_frames`, `max_new_tokens` | The grouping key |
-| `num_frames_actual` | The one distinct actual frame count across runs, or `None` if runs disagree (which means some clips were shorter than the request) |
-| `window_sec` | The stride the verdict is judged against, or `None` if runs disagree |
+| `num_frames_actual` | The one distinct actual frame count across runs, or `None` if runs disagree |
+| `n_windows` | Distinct `(clip, window)` pairs sampled. `n_success == n_windows × repeats`. This is the **effective sample diversity**: distinct windows vary the content and so the response length, whereas repeats re-run identical content and under greedy decoding capture machine jitter only |
+| `window_sec` | The window length and verdict denominator, or `None` if runs disagree |
 
 ### 2.3 Latency
 
@@ -158,7 +208,9 @@ Percentiles use linear interpolation over all successful runs of the config.
 
 With fewer than ~20 successful runs the interpolated p95 lands in the top
 interval and is effectively the max; the report flags this and prints
-`max_e2e_latency_ms` alongside so the two can be compared.
+`max_e2e_latency_ms` alongside so the two can be compared. Windowed sampling
+raises the run count by the number of windows per clip, which both tightens the
+percentile and makes it reflect content-driven variance rather than pure jitter.
 
 ### 2.4 Real-time
 
@@ -166,7 +218,7 @@ interval and is effectively the max; the report flags this and prints
 |---|---|
 | `p50_window_rtf` / `p95_window_rtf` | Percentiles of `window_rtf` — the criterion |
 | `p50_rtf` / `p95_rtf` | Percentiles of `rtf` — reference only, duration-confounded (§1.5) |
-| `mean_max_sustainable_fps` | Mean of `max_sustainable_fps` |
+| `mean_max_sustainable_fps` | Mean of `max_sustainable_fps`. Real time means this is at least the input density `num_frames / window_sec` — exactly equivalent to `window_rtf ≤ 1` |
 
 ### 2.5 Phase and token means
 
@@ -264,4 +316,7 @@ Always read `n_points` alongside it.
 `uv run scripts/test_realtime_metrics.py` checks these definitions without a
 GPU or model weights: the phase-split identities, the first-token timestamp,
 slope recovery against a known linear model, duration-independence of
-`window_rtf`, failure gating, energy integration, and config ranking.
+`window_rtf`, failure gating, energy integration, and config ranking. Windowed
+sampling is checked against `video.mp4`: half-open tiling with no shared frames,
+timestamps inside their window, partial tails dropped, the frame-capacity error,
+and that `window_sec == clip duration` is byte-identical to unwindowed sampling.

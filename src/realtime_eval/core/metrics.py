@@ -284,9 +284,14 @@ def fit_frame_scaling(results: list[RealtimeResult]) -> list[FrameScaling]:
 class ConfigSummary:
     """Aggregated metrics for one ``(model, frames, tokens)`` config.
 
-    Timing and quality fields describe the successful runs only;
-    ``n_attempted`` / ``success_rate`` describe how many runs there were, so a
-    config that mostly crashed cannot look like a clean fast one.
+    Metric fields describe the successful runs only; ``n_attempted`` /
+    ``success_rate`` describe how many runs there were, so a config that mostly
+    crashed cannot look like a clean fast one.
+
+    ``n_success`` is ``n_windows * repeats``. The two contribute differently:
+    distinct windows vary the content and so the response length, while repeats
+    re-run identical content and under greedy decoding capture machine jitter
+    only. Read ``n_windows`` as the effective sample diversity.
     """
 
     model_id: str
@@ -297,6 +302,7 @@ class ConfigSummary:
     n_error: int
     success_rate: float
     num_frames_actual: int | None
+    n_windows: int
     window_sec: float | None
     p50_e2e_latency_ms: float | None
     p95_e2e_latency_ms: float | None
@@ -422,6 +428,7 @@ def aggregate(
                 n_error=len(attempted) - len(items),
                 success_rate=success_rate,
                 num_frames_actual=_single([_frames_of(r) for r in items]),
+                n_windows=len({(r.video, r.window_index) for r in items}),
                 window_sec=_single_float(column(items, "window_sec")),
                 p50_e2e_latency_ms=percentile(latencies, 50),
                 p95_e2e_latency_ms=percentile(latencies, 95),

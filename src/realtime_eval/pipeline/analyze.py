@@ -54,9 +54,9 @@ def format_table(summaries: list[ConfigSummary]) -> str:
         A multi-line string sorted by model, then frame count.
     """
     header = (
-        f"{'model':<18}{'frames':>7}{'tok':>5}{'p50_e2e':>9}{'p95_e2e':>9}"
-        f"{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}{'p95_wrtf':>10}{'p95_rtf':>9}"
-        f"{'fps':>7}{'toks':>7}{'J':>8}{'W':>7}{'vramGB':>8}"
+        f"{'model':<18}{'frames':>7}{'tok':>5}{'win':>5}{'dens':>6}"
+        f"{'p50_e2e':>9}{'p95_e2e':>9}{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}"
+        f"{'p95_wrtf':>10}{'sust':>7}{'toks':>7}{'J':>8}{'W':>7}{'vramGB':>8}"
         f"{'ok':>7}{'RT?':>5}"
     )
     lines = [header, "-" * len(header)]
@@ -64,14 +64,14 @@ def format_table(summaries: list[ConfigSummary]) -> str:
         rt = "yes" if s.meets_realtime_p95 else "no"
         lines.append(
             f"{model_name_from_id(s.model_id):<18}"
-            f"{s.num_frames:>7}{s.max_new_tokens:>5}"
+            f"{s.num_frames:>7}{s.max_new_tokens:>5}{s.n_windows:>5}"
+            f"{_fmt(s.num_frames / s.window_sec if s.window_sec else None, '.1f'):>6}"
             f"{_fmt(s.p50_e2e_latency_ms, '.0f'):>9}"
             f"{_fmt(s.p95_e2e_latency_ms, '.0f'):>9}"
             f"{_fmt(s.max_e2e_latency_ms, '.0f'):>9}"
             f"{_fmt(s.p95_ttft_ms, '.0f'):>10}"
             f"{_fmt(s.mean_tpot_ms, '.1f'):>7}"
             f"{_fmt(s.p95_window_rtf):>10}"
-            f"{_fmt(s.p95_rtf):>9}"
             f"{_fmt(s.mean_max_sustainable_fps, '.1f'):>7}"
             f"{_fmt(s.mean_tokens, '.0f'):>7}"
             f"{_fmt(s.mean_energy_j, '.1f'):>8}"
@@ -186,9 +186,14 @@ def analyze(run_dir: Path, threshold: float = 0.8, min_success_rate: float = 1.0
             "intelligence_eval, not this benchmark."
         )
     legend = (
-        "\nwrtf = window_rtf (latency / deployment stride; the real-time test).  "
-        "rtf = latency / clip duration,\nreference only -- it scales as "
-        "1/duration, so it reflects clip lengths as much as the model.\n"
+        "\nwin = distinct windows sampled (x repeats = ok runs); dens = input "
+        "frames/sec fed to the\nmodel (num_frames / window_sec); sust = "
+        "max_sustainable_fps, the rate the pipeline keeps up\nwith -- real time "
+        "means sust >= dens, equivalently wrtf <= 1.\n"
+        "wrtf = window_rtf = latency / window_sec, the real-time test. rtf "
+        "(latency / whole-clip\nduration) is in summary.json but not shown: it "
+        "compares one window's latency against a\nclip of many windows, so it "
+        "scales as 1/duration and says more about clip lengths.\n"
         "J = energy per inference, W = time-weighted board power, vramGB = peak "
         "device-wide VRAM\n(includes CUDA context). Power is whole-board: only "
         "meaningful on an otherwise idle GPU."
