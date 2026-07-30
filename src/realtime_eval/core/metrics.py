@@ -7,7 +7,7 @@ from typing import Any
 # Bumped whenever a metric's definition or name changes, so a run directory
 # records which definitions produced it. Results from different versions are
 # not comparable.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -23,12 +23,15 @@ class RealtimeResult:
         label: Ground-truth action label.
         model_id: HuggingFace model ID used.
         num_frames: Frames *requested* for this config.
-        num_frames_actual: Frames actually fed to the model. Lower than
-            ``num_frames`` for clips with fewer frames than requested, since
-            duplicate sample indices are dropped. Use this, not ``num_frames``,
-            as the denominator of any per-frame quantity.
+        num_frames_actual: Frames actually fed to the model. Normally equals
+            ``num_frames``: a window short of frames is rejected up front by
+            :func:`realtime_eval.pipeline.runner.build_window_cache`. Use this,
+            not ``num_frames``, as the denominator of any per-frame quantity.
         max_new_tokens: Generation cap for this run.
         repeat_index: Zero-based index of the timed repeat.
+        window_index: Zero-based window position within the source clip. Each
+            window is an independent sample: the frames span that window only.
+        window_start_sec: Window start offset in the source clip.
         e2e_latency_ms: Whole timed region: preprocess + prefill + decode.
         preprocess_ms: Chat templating, image preprocessing, host-to-device copy.
         prefill_ms: Preprocessed inputs to first generated token.
@@ -39,20 +42,20 @@ class RealtimeResult:
         throughput_tps: End-to-end rate, ``tokens / e2e_latency_sec``.
         ttft_source: How ``ttft_ms`` was obtained, so results from different
             backends are never compared blindly.
-        window_sec: Deployment stride this run is judged against -- one
-            inference per ``window_sec`` of incoming video.
+        window_sec: The window this run covers: the frames span exactly this
+            many seconds, and a deployment runs one inference per
+            ``window_sec`` of incoming video. Sets both what was sampled and
+            the denominator of ``window_rtf``.
         window_rtf: ``e2e_latency_sec / window_sec``. The real-time criterion:
             <= 1.0 means the pipeline consumes video at least as fast as it
             arrives. Independent of clip length.
         max_sustainable_fps: ``num_frames_actual / e2e_latency_sec`` -- the input
             frame rate this pipeline can keep up with.
-        rtf: ``e2e_latency_sec / video_duration_sec``, the conventional
-            real-time factor (<= 1.0 is faster than playback). Reported for
-            reference only: frame count is fixed regardless of clip length, so
-            compute per inference is constant while the denominator varies, and
-            this ratio scales as ``1 / duration``. Longer clips pass trivially,
-            which makes it a property of the video set as much as the model.
-            Use ``window_rtf`` to decide.
+        rtf: ``e2e_latency_sec / video_duration_sec``, against the **whole
+            clip**. Reported for reference only, and actively misleading under
+            windowed sampling: it compares one window's latency to a clip
+            spanning many windows, so it scales as ``1 / duration`` and longer
+            clips pass trivially. Use ``window_rtf`` to decide.
         video_duration_sec: Source clip duration.
         tokens: Number of generated tokens.
         energy_j: Energy drawn over the inference, integrated from timestamped
@@ -86,6 +89,8 @@ class RealtimeResult:
     max_new_tokens: int
     num_frames_actual: int | None = None
     repeat_index: int = 0
+    window_index: int | None = None
+    window_start_sec: float | None = None
     e2e_latency_ms: float | None = None
     preprocess_ms: float | None = None
     prefill_ms: float | None = None

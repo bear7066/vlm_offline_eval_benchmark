@@ -47,6 +47,33 @@ def frame_span(
     return first, last
 
 
+def probe_video(video_path: Path) -> tuple[int | None, float | None, float | None]:
+    """Read a clip's frame count, FPS and duration without decoding any frame.
+
+    Cheap enough to call for every clip before a sweep starts: it opens the
+    container and reads header properties only.
+
+    Args:
+        video_path: Path to the video file.
+
+    Returns:
+        ``(total_frames, fps, duration_sec)``, each ``None`` when unavailable.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        return None, None, None
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+        fps = cap.get(cv2.CAP_PROP_FPS) or None
+        duration = get_video_duration(total_frames, fps) if total_frames else None
+        return total_frames, fps, duration
+    finally:
+        cap.release()
+
+
 def sample_frames(
     video_path: Path,
     num_frames: int = 8,

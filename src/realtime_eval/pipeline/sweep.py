@@ -16,7 +16,7 @@ from vlm_eval.paths import model_name_from_id, slugify
 from realtime_eval.core.config import SweepConfig
 from realtime_eval.core.dataset import discover_videos
 from realtime_eval.core.metrics import SCHEMA_VERSION, RealtimeResult, aggregate
-from realtime_eval.pipeline.runner import build_sample_cache, load_model, run_config
+from realtime_eval.pipeline.runner import build_window_cache, load_model, run_config
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,9 @@ def run_single(
 ) -> list[RealtimeResult]:
     """Run one model on one video for quick verification.
 
-    Loads the model, samples ``num_frames``, runs ``warmup`` discarded
-    iterations, then ``repeats`` timed iterations. Nothing is written to disk;
+    Loads the model, tiles the clip into ``window_sec`` windows, samples
+    ``num_frames`` from each, runs ``warmup`` discarded iterations, then
+    ``repeats`` timed iterations per window. Nothing is written to disk;
     results are returned for the caller to display.
 
     Args:
@@ -49,11 +50,12 @@ def run_single(
         warmup: Discarded iterations before timing.
         label: Ground-truth label override; defaults to the file's parent
             directory name (the project convention).
-        window_sec: Deployment stride the real-time verdict is judged against.
+        window_sec: Window length; frames span exactly this much video, and it
+            is the denominator of ``window_rtf``.
         power_interval_sec: Background power sampling period.
 
     Returns:
-        One :class:`RealtimeResult` per timed repeat.
+        One :class:`RealtimeResult` per ``(window, repeat)``.
     """
     load_dotenv()
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -173,7 +175,14 @@ def run_sweep(
 
         for num_frames in config.num_frames_grid:
             # Decode once per frame count, not once per (frames, tokens) pair.
-            frame_cache = build_sample_cache(videos, num_frames)
+            frame_cache = build_window_cache(videos, num_frames, config.window_sec)
+            logger.info(
+                "Sampled %d window(s) of %gs at %d frames (%.1f fps density)",
+                len(frame_cache),
+                config.window_sec,
+                num_frames,
+                num_frames / config.window_sec,
+            )
             for max_new_tokens in config.max_new_tokens_grid:
                 logger.info(
                     "Config: %s | frames=%d | max_new_tokens=%d",

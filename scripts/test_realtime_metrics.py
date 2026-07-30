@@ -26,6 +26,7 @@ from realtime_eval.core.power import DeviceSampler
 from realtime_eval.pipeline.analyze import best_config
 from vlm_eval.hardware import get_gpu_power_watts
 from vlm_eval.inference.gemma import HuggingFaceVLM, _first_token_streamer_cls
+from realtime_eval.pipeline.runner import build_window_cache
 from vlm_eval.video import frame_span, sample_frames
 
 # Deliberately word-shaped: the first token has no trailing space, which is
@@ -499,6 +500,75 @@ def check_empty_window_returns_none() -> None:
         assert frames is None, (start, end, frames)
 
 
+def _video() -> Path | None:
+    v = Path(__file__).resolve().parents[1] / "video.mp4"
+    return v if v.exists() else None
+
+
+def check_window_cache_tiles_the_clip() -> None:
+    """A 4 s clip at 1 s windows must yield 4 samples, one per window."""
+    video = _video()
+    if video is None:
+        print("  (skipped window cache check: video.mp4 absent)")
+        return
+
+    windows = build_window_cache([(video, "fall_general")], num_frames=8, window_sec=1.0)
+    assert len(windows) == 4, len(windows)
+    assert [w.index for w in windows] == [0, 1, 2, 3]
+    assert [w.start_sec for w in windows] == [0.0, 1.0, 2.0, 3.0]
+    for w in windows:
+        assert len(w.frames) == 8, (w.index, len(w.frames))
+        assert w.label == "fall_general"
+        # clip duration stays the whole clip, not the window
+        assert abs(w.clip_duration_sec - 4.0) < 0.05, w.clip_duration_sec
+
+    # window_sec == clip duration collapses to a single whole-clip sample,
+    # reproducing the pre-window behaviour.
+    (single,) = build_window_cache([(video, "x")], num_frames=8, window_sec=4.0)
+    assert single.index == 0 and single.start_sec == 0.0
+    assert len(single.frames) == 8
+
+
+def check_window_cache_rejects_too_many_frames() -> None:
+    """A window that cannot supply num_frames must fail before any inference."""
+    video = _video()
+    if video is None:
+        print("  (skipped frame-capacity check: video.mp4 absent)")
+        return
+
+    # 0.25 s at 30 fps supplies at most floor(7.5) = 7 frames.
+    try:
+        build_window_cache([(video, "x")], num_frames=8, window_sec=0.25)
+    except ValueError as exc:
+        msg = str(exc)
+        assert "at most 7 frames" in msg, msg
+        assert "0.2667" in msg, "should say how large window_sec must be"
+    else:
+        raise AssertionError("expected a capacity failure")
+
+    # Exactly at capacity is fine, and yields 16 windows.
+    windows = build_window_cache([(video, "x")], num_frames=7, window_sec=0.25)
+    assert len(windows) == 16, len(windows)
+    assert all(len(w.frames) == 7 for w in windows)
+
+
+def check_window_cache_drops_partial_tail() -> None:
+    """Only whole windows are benchmarked; a short tail is discarded."""
+    video = _video()
+    if video is None:
+        print("  (skipped partial-tail check: video.mp4 absent)")
+        return
+
+    # 4.0 s at 1.5 s windows -> windows at 0.0 and 1.5; the 1.0 s tail is
+    # dropped rather than benchmarked at a different frame density.
+    windows = build_window_cache([(video, "x")], num_frames=8, window_sec=1.5)
+    assert len(windows) == 2, len(windows)
+    assert [w.start_sec for w in windows] == [0.0, 1.5]
+
+    # A window longer than the clip leaves nothing to benchmark.
+    assert build_window_cache([(video, "x")], num_frames=8, window_sec=10.0) == []
+
+
 def demo() -> None:
     check_first_token_timestamp()
     check_phase_split()
@@ -522,6 +592,9 @@ def demo() -> None:
     check_frame_span_is_half_open()
     check_windowed_sampling_on_real_video()
     check_empty_window_returns_none()
+    check_window_cache_tiles_the_clip()
+    check_window_cache_rejects_too_many_frames()
+    check_window_cache_drops_partial_tail()
     print("ok")
 
 
