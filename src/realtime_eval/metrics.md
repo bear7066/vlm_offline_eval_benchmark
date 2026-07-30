@@ -13,7 +13,7 @@ than reinterpreting them.
 
 ## 1. Per-run metrics — `RealtimeResult`
 
-One record per `(video, repeat)`. 33 fields.
+One record per `(video, repeat)`. 32 fields.
 
 ### 1.1 Identity and configuration
 
@@ -110,8 +110,7 @@ Both views are reported because they answer different questions.
 
 | Field | Definition |
 |---|---|
-| `response` | Model output text, stripped |
-| `label_word_overlap` | Whether the response contained any label content word (longer than two characters). **Not correctness** — see §2.7 |
+| `response` | Model output text, stripped. Recorded for inspection only — response quality is scored by `intelligence_eval`, not here |
 | `status` | `"success"` or `"error"` |
 | `error` | Failure message when `status == "error"` |
 
@@ -119,9 +118,10 @@ Both views are reported because they answer different questions.
 
 ## 2. Per-config metrics — `ConfigSummary`
 
-One record per `(model_id, num_frames, max_new_tokens)`. 32 fields. Metric
+One record per `(model_id, num_frames, max_new_tokens)`. 30 fields. Metric
 columns describe the **successful** runs; the counts in §2.1 describe every
-attempt.
+attempt. This benchmark measures performance only — no quality metric is
+reported, since `intelligence_eval` covers that axis.
 
 ### 2.1 Reliability
 
@@ -177,7 +177,7 @@ interval and is effectively the max; the report flags this and prints
 | `mean_decode_ms` | Mean `decode_ms`. Varies with how many tokens were generated as well as how fast; use `mean_tpot_ms` for speed alone |
 | `mean_tpot_ms` | Mean `tpot_ms` — per-token latency, independent of response length |
 | `mean_decode_tps` | Mean `decode_tps` |
-| `mean_tokens` | Mean generated tokens. Read this next to `naive_word_overlap`: it makes the verbosity confound visible |
+| `mean_tokens` | Mean generated tokens. Drives `mean_decode_ms`, so it explains latency differences between token caps |
 
 ### 2.6 Resources
 
@@ -188,35 +188,7 @@ interval and is effectively the max; the report flags this and prints
 | `mean_peak_vram_reserved_gb` | Mean of `peak_vram_reserved_gb` |
 | `max_peak_vram_device_gb` | **Max** of `peak_vram_device_gb`. A max, not a mean: sizing hardware needs the worst case |
 
-### 2.7 Quality
-
-| Field | Definition |
-|---|---|
-| `n_videos_scored` | Videos contributing to the quality score |
-| `naive_word_overlap` | Fraction of scored videos whose response contained ≥ 1 label content word |
-
-`naive_word_overlap` is a crude proxy so the sweep is runnable without an LLM
-judge. It is **not accuracy** and must not be used to rank configs:
-
-- **It rewards verbosity.** A longer response has strictly more chances to hit
-  a label word, so raising `max_new_tokens` raises the score for free — and
-  `max_new_tokens` is a swept axis, so the metric is confounded with the very
-  thing the sweep varies.
-- **It ignores meaning.** A response naming the label while describing the
-  opposite event still counts as a hit.
-- **It assumes a shared vocabulary.** It is meaningless when the prompt and the
-  labels use different ones, e.g. an accident-detection prompt against action
-  labels.
-
-Scoring counts each video **once** (`repeat_index == 0`). Decoding is greedy, so
-repeats of a video are byte-identical and carry no extra information; counting
-them inflated the denominator by a factor of `repeats` while the effective
-sample size stayed at the number of videos.
-
-Replace with the `vlm_eval.judge` pipeline before drawing any quality
-conclusion.
-
-### 2.8 The verdict
+### 2.7 The verdict
 
 | Field | Definition |
 |---|---|
@@ -231,10 +203,10 @@ ratios only and no pass/fail flag.
 
 **Config ranking** (`best_config`) selects, among configs with
 `meets_realtime_p95`, the one with the most frames — the most temporal evidence
-per inference — tie-broken by lower p95 latency. It deliberately does **not**
-rank on `naive_word_overlap`, which would recommend whichever config was
-allowed to talk longest. Restore quality-based ranking only once a real judge
-supplies scores.
+per inference — tie-broken by lower p95 latency. Performance only: this
+benchmark does not score response quality, so the pick is the most capable
+config that is fast enough, not the most accurate one. Quality lives in
+`intelligence_eval`.
 
 ---
 
@@ -292,5 +264,4 @@ Always read `n_points` alongside it.
 `uv run scripts/test_realtime_metrics.py` checks these definitions without a
 GPU or model weights: the phase-split identities, the first-token timestamp,
 slope recovery against a known linear model, duration-independence of
-`window_rtf`, failure gating, energy integration, and that config ranking
-ignores the quality proxy.
+`window_rtf`, failure gating, energy integration, and config ranking.

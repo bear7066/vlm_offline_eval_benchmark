@@ -8,7 +8,7 @@ from vlm_eval.hardware import get_peak_vram_reserved_gb, reset_peak_memory_stats
 from vlm_eval.inference.gemma import HuggingFaceVLM
 from vlm_eval.video import sample_frames
 
-from realtime_eval.core.metrics import RealtimeResult, label_word_overlap
+from realtime_eval.core.metrics import RealtimeResult
 from realtime_eval.core.power import DeviceSampler
 
 logger = logging.getLogger(__name__)
@@ -219,7 +219,6 @@ def run_config(
                     video_duration_sec=duration_sec,
                     tokens=tokens,
                     response=response,
-                    label_word_overlap=label_word_overlap(response, label),
                     **device,
                 )
             )

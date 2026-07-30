@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import asdict, dataclass, field, fields
 from statistics import StatisticsError, fmean, linear_regression
 from typing import Any
@@ -74,10 +73,8 @@ class RealtimeResult:
         peak_vram_device_gb: Highest device-wide VRAM use observed, from
             ``mem_get_info``. Includes the CUDA context and any other process
             on the card -- size deployment hardware against this.
-        response: Model output text.
-        label_word_overlap: Whether the response contained a label content word.
-            A verbosity-confounded proxy, not correctness -- see
-            :func:`label_word_overlap`.
+        response: Model output text. Recorded for inspection only; response
+            quality is scored by ``intelligence_eval``, not here.
         status: ``"success"`` or ``"error"``.
         error: Error message when ``status == "error"``.
     """
@@ -112,7 +109,6 @@ class RealtimeResult:
     peak_vram_reserved_gb: float | None = None
     peak_vram_device_gb: float | None = None
     response: str = ""
-    label_word_overlap: bool | None = None
     status: str = "success"
     error: str | None = None
 
@@ -141,45 +137,6 @@ def percentile(values: list[float], q: float) -> float | None:
     high = min(low + 1, len(ordered) - 1)
     frac = rank - low
     return ordered[low] + (ordered[high] - ordered[low]) * frac
-
-
-_WORD_RE = re.compile(r"[a-z0-9]+")
-
-
-def label_word_overlap(response: str, label: str) -> bool:
-    """Does the response contain any content word from the label?
-
-    A crude proxy so the sweep is runnable without an LLM judge -- **not
-    accuracy**, and not safe to rank configs by:
-
-    - It rewards verbosity. A longer response has strictly more chances to hit
-      a label word, so raising ``max_new_tokens`` raises this score for free.
-      Since ``max_new_tokens`` is a swept axis, the metric is confounded with
-      the very thing the sweep varies. Read it next to ``mean_tokens``.
-    - It ignores meaning entirely: a response that names the label while
-      describing the opposite event still counts as a hit.
-    - It is meaningless when the prompt and the labels use different
-      vocabularies, e.g. an accident-detection prompt against action labels.
-
-    Replace with the ``vlm_eval.judge`` pipeline before drawing any quality
-    conclusion.
-
-    Args:
-        response: Model output text.
-        label: Ground-truth label (underscores treated as spaces).
-
-    Returns:
-        True if any label content word (longer than two characters) is present.
-    """
-    resp_words = set(_WORD_RE.findall(response.lower()))
-    label_words = {
-        word
-        for word in _WORD_RE.findall(label.replace("_", " ").lower())
-        if len(word) > 2
-    }
-    if not label_words:
-        return False
-    return bool(resp_words & label_words)
 
 
 def _ols_fit(
@@ -356,8 +313,6 @@ class ConfigSummary:
     max_peak_vram_device_gb: float | None
     mean_energy_j: float | None
     mean_power_watts: float | None
-    n_videos_scored: int
-    naive_word_overlap: float | None
     meets_realtime_p95: bool | None
 
     def to_dict(self) -> dict[str, Any]:
@@ -446,14 +401,6 @@ def aggregate(
         ttfts = column(items, "ttft_ms")
         window_rtfs = column(items, "window_rtf")
         rtfs = column(items, "rtf")
-        # Decoding is greedy, so repeats of a video are byte-identical and add
-        # no information. Score each video once, or the denominator is inflated
-        # by a factor of `repeats` while the effective sample size is n_videos.
-        scored = [
-            r.label_word_overlap
-            for r in items
-            if r.repeat_index == 0 and r.label_word_overlap is not None
-        ]
         p95_window_rtf = percentile(window_rtfs, 95)
         meets_realtime = (
             (p95_window_rtf <= threshold and success_rate >= min_success_rate)
@@ -493,8 +440,6 @@ def aggregate(
                 ),
                 mean_energy_j=_mean(column(items, "energy_j")),
                 mean_power_watts=_total_ratio(items, "energy_j", "power_sampled_sec"),
-                n_videos_scored=len(scored),
-                naive_word_overlap=(sum(scored) / len(scored)) if scored else None,
                 meets_realtime_p95=meets_realtime,
             )
         )

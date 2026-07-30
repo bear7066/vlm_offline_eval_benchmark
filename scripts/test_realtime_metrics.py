@@ -19,7 +19,6 @@ from realtime_eval.core.metrics import (
     RealtimeResult,
     aggregate,
     fit_frame_scaling,
-    label_word_overlap,
     result_from_dict,
 )
 from realtime_eval.core.power import DeviceSampler
@@ -207,7 +206,6 @@ def _synth(frames: int, max_tokens: int = 20, **over) -> RealtimeResult:
         window_rtf=0.5,
         max_sustainable_fps=float(frames) / 0.5,
         rtf=0.5,
-        label_word_overlap=True,
     )
     fields.update(over)
     return RealtimeResult(**fields)
@@ -413,39 +411,9 @@ def check_power_reading_is_cheap() -> None:
     print(f"  power reading: {per_call_ms:.3f} ms/call")
 
 
-# --- quality axis (C3) ----------------------------------------------------
-
-
-def check_overlap_scored_once_per_video() -> None:
-    """Greedy repeats are identical, so they must not inflate the denominator."""
-    items = [_synth(8, repeat_index=i) for i in range(5)]
-    items += [_synth(8, video="b.mp4", repeat_index=i, label_word_overlap=False) for i in range(5)]
-    (summary,) = aggregate(items)
-
-    assert summary.n_success == 10, summary  # latency still uses every run
-    assert summary.n_videos_scored == 2, summary  # quality uses each video once
-    assert summary.naive_word_overlap == 0.5, summary
-
-
-def check_overlap_is_verbosity_confounded() -> None:
-    """The proxy rises with response length, so it tracks the swept token cap."""
-    label = "fall_general"
-    terse = "everything is normal"
-    verbose = "everything is normal, no fall or general incident is visible here"
-    assert label_word_overlap(terse, label) is False
-    assert label_word_overlap(verbose, label) is True, "longer text hits by chance"
-
-
-def check_best_config_ignores_overlap() -> None:
-    """Ranking must follow frames, not the placeholder quality proxy."""
-    low_frames_high_overlap = [_synth(8)]
-    high_frames_low_overlap = [_synth(16, label_word_overlap=False)]
-    summaries = aggregate(low_frames_high_overlap + high_frames_low_overlap)
-
-    by_frames = {s.num_frames: s for s in summaries}
-    assert by_frames[8].naive_word_overlap == 1.0
-    assert by_frames[16].naive_word_overlap == 0.0
-
+def check_best_config_ranks_on_frames() -> None:
+    """Ranking follows frames then latency; nothing else is consulted."""
+    summaries = aggregate([_synth(8), _synth(16)])
     pick = best_config(summaries)
     assert pick is not None and pick.num_frames == 16, pick
 
@@ -473,9 +441,7 @@ def demo() -> None:
     check_power_aggregates_by_total_energy()
     check_vram_reports_both_views()
     check_power_reading_is_cheap()
-    check_overlap_scored_once_per_video()
-    check_overlap_is_verbosity_confounded()
-    check_best_config_ignores_overlap()
+    check_best_config_ranks_on_frames()
     print("ok")
 
 

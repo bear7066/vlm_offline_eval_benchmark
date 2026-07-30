@@ -57,7 +57,7 @@ def format_table(summaries: list[ConfigSummary]) -> str:
         f"{'model':<18}{'frames':>7}{'tok':>5}{'p50_e2e':>9}{'p95_e2e':>9}"
         f"{'max_e2e':>9}{'p95_ttft':>10}{'tpot':>7}{'p95_wrtf':>10}{'p95_rtf':>9}"
         f"{'fps':>7}{'toks':>7}{'J':>8}{'W':>7}{'vramGB':>8}"
-        f"{'ovlp':>7}{'n':>4}{'ok':>7}{'RT?':>5}"
+        f"{'ok':>7}{'RT?':>5}"
     )
     lines = [header, "-" * len(header)]
     for s in sorted(summaries, key=lambda x: (x.model_id, x.num_frames, x.max_new_tokens)):
@@ -77,8 +77,6 @@ def format_table(summaries: list[ConfigSummary]) -> str:
             f"{_fmt(s.mean_energy_j, '.1f'):>8}"
             f"{_fmt(s.mean_power_watts, '.0f'):>7}"
             f"{_fmt(s.max_peak_vram_device_gb, '.2f'):>8}"
-            f"{_fmt(s.naive_word_overlap):>7}"
-            f"{s.n_videos_scored:>4}"
             f"{f'{s.n_success}/{s.n_attempted}':>7}"
             f"{rt:>5}"
         )
@@ -120,11 +118,9 @@ def best_config(summaries: list[ConfigSummary]) -> ConfigSummary | None:
     Ranks on frame count -- the most temporal evidence the model gets per
     inference -- breaking ties toward lower p95 latency.
 
-    Deliberately does **not** rank on ``naive_word_overlap``. That proxy rewards
-    verbosity, so it rises with ``max_new_tokens``, which is itself a swept axis;
-    ranking on it would recommend whichever config was allowed to talk longest.
-    Restore quality-based ranking only once ``vlm_eval.judge`` supplies real
-    scores.
+    Performance only: response quality is out of scope for this benchmark and is
+    scored by ``intelligence_eval``, so the pick here is the most capable config
+    that is fast enough, not the most accurate one.
 
     Args:
         summaries: Aggregated config summaries.
@@ -186,8 +182,8 @@ def analyze(run_dir: Path, threshold: float = 0.8, min_success_rate: float = 1.0
             f"at {window} (p95={_fmt(pick.p95_window_rtf)}, p95 latency="
             f"{_fmt(pick.p95_e2e_latency_ms, '.0f')} ms, "
             f"{pick.n_success}/{pick.n_attempted} runs ok).\n"
-            "  Quality is NOT ranked: ovlp is a verbosity-confounded proxy, not "
-            "accuracy. Wire up the LLM judge before choosing on quality."
+            "  Performance only -- response quality is scored by "
+            "intelligence_eval, not this benchmark."
         )
     legend = (
         "\nwrtf = window_rtf (latency / deployment stride; the real-time test).  "
